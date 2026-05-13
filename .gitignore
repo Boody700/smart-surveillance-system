@@ -179,3 +179,14 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# --- Project Specific Ignores ---
+*.pt
+*.weights
+videos/*
+!videos/.gitkeep
+crops/*
+!crops/.gitkeep
+reports/*
+!reports/.gitkeep
+database/*.db
