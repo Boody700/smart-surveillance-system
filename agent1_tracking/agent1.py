@@ -27,6 +27,7 @@ cursor = conn.cursor()
 # We wipe the events table so old data from a previous run never
 # bleeds into the current analysis and confuses Agents 2, 3, and 4.
 cursor.execute("DELETE FROM events")
+cursor.execute("DELETE FROM sqlite_sequence WHERE name='events'")
 conn.commit()
 print(f"[INFO] Connected to database: {DATABASE_PATH}")
 print(f"[INFO] Previous events cleared. Starting fresh analysis.")
@@ -48,7 +49,7 @@ print(f"[INFO] Writing detections to database every frame...")
 # --- SET UP OUTPUT VIDEO FOR VISUAL VERIFICATION ---
 output_dir = os.path.join(ROOT_DIR, "output_videos")
 os.makedirs(output_dir, exist_ok=True)
-output_path = os.path.join(output_dir, "output_agent1_final.mp4")
+output_path = os.path.join(output_dir, "output_agent1_final(2).mp4")
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 video_writer = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
@@ -62,8 +63,8 @@ id_registry     = {}    # Maps raw YOLO ID -> clean sequential ID
 next_clean_id   = 1     # Our clean people counter
 
 # How many consecutive frames a detection must survive before we trust it.
-# 15 frames = ~0.5 seconds. Filters out chair ghosts and shadow blips.
-MIN_FRAMES_TO_CONFIRM = 15
+# 12 frames = ~0.4 seconds. Filters out chair ghosts and shadow blips.
+MIN_FRAMES_TO_CONFIRM = 12
 
 frame_count = 0
 
@@ -86,7 +87,7 @@ while True:
         tracker="agent1_tracking/custom_tracker.yaml",
         classes=[0],    # Only detect people (class 0 in COCO dataset)
         iou=0.20,       # Aggressively merge overlapping boxes (kills chair doubles)
-        imgsz=1280,     # Higher resolution scan to catch far-away people
+        imgsz=1536,     # Higher resolution scan to catch far-away people
         verbose=False   # Suppress YOLO's built-in console spam
     )
 
@@ -136,11 +137,12 @@ while True:
 
                 # Draw clean green bounding box and ID label on the frame
                 x1, y1, x2, y2 = box
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.rectangle(frame, (x1, y1 - 25), (x1 + 145, y1), (0, 255, 0), -1)
-                cv2.putText(frame, f"Person ID: {clean_id}", (x1 + 5, y1 - 7),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 1)
+                label = f"ID:{clean_id}"
+                (txt_w, txt_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+                cv2.rectangle(frame, (x1, y1 - txt_h - 6), (x1 + txt_w + 4, y1), (0, 255, 0), -1)
+                cv2.putText(frame, label, (x1 + 2, y1 - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
     # Commit to database every 30 frames to avoid hammering the disk
     if frame_count % 30 == 0:
         conn.commit()

@@ -3,7 +3,7 @@ import os
 
 # Project Paths
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-VIDEO_PATH = os.path.join(ROOT_DIR, "videos", "input.mp4") # Change 'input.mp4' to your filename
+VIDEO_PATH = os.path.join(ROOT_DIR, "videos", "input1.mp4") 
 DATABASE_PATH = os.path.join(ROOT_DIR, "database", "sentinel.db")
 CROPS_DIR = os.path.join(ROOT_DIR, "crops")
 

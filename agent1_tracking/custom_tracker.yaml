@@ -4,11 +4,11 @@
 tracker_type: bytetrack
 
 
-track_low_thresh: 0.08    # Low-bar tracking safety net to hold on to people behind cubicle dividers
+track_low_thresh: 0.05    # Low-bar tracking safety net to hold on to people behind cubicle dividers
 new_track_thresh: 0.55    # Was 0.45 — chair shadows rarely hit 55% confidence
 track_high_thresh: 0.35   # Slightly higher bar for high-quality matching
 
-track_buffer: 300         # Keeps IDs alive for 10 seconds if they duck out of view
+track_buffer: 450         # Keeps IDs alive for 10 seconds if they duck out of view
 
 # --- THE ACCELERATING MOTION & ID SWITCH FIX ---
 # Easing the match threshold allows the tracking system to maintain lock 
