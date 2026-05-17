@@ -8,4 +8,4 @@ DATABASE_PATH = os.path.join(ROOT_DIR, "database", "sentinel.db")
 CROPS_DIR = os.path.join(ROOT_DIR, "crops")
 
 # Model Settings
-MODEL_NAME = "yolo26n.pt"  # The latest YOLO model for 2026
+MODEL_NAME = "yolo26s.pt"  # The latest YOLO model for 2026
