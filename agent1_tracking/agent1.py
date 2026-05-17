@@ -49,7 +49,7 @@ print(f"[INFO] Writing detections to database every frame...")
 # --- SET UP OUTPUT VIDEO FOR VISUAL VERIFICATION ---
 output_dir = os.path.join(ROOT_DIR, "output_videos")
 os.makedirs(output_dir, exist_ok=True)
-output_path = os.path.join(output_dir, "output_agent1_final(2).mp4")
+output_path = os.path.join(output_dir, "output_agent1_final.mp4")
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 video_writer = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
@@ -85,7 +85,8 @@ while True:
         frame,
         persist=True,
         tracker="agent1_tracking/custom_tracker.yaml",
-        classes=[0],    # Only detect people (class 0 in COCO dataset)
+        classes=[0],  # Only detect people (class 0 in COCO dataset)
+        conf=0.20,      # Lower confidence threshold to catch more distant people (Agent 2 will filter out the noise)
         iou=0.20,       # Aggressively merge overlapping boxes (kills chair doubles)
         imgsz=1536,     # Higher resolution scan to catch far-away people
         verbose=False   # Suppress YOLO's built-in console spam
