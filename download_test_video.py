@@ -10,7 +10,7 @@ videos_dir = os.path.join(ROOT_DIR, "videos")
 os.makedirs(videos_dir, exist_ok=True)
 
 # The destination path we want for the file
-output_file_path = os.path.join(videos_dir, "input1.mp4")
+output_file_path = os.path.join(videos_dir, "input(1).mp4")
 
 # YouTube URL provided
 video_url = "https://youtu.be/LOSv_iojT7E?si=3qsDNWPHeQmYw5Lg"
