@@ -1,0 +1,18 @@
+# agent1_tracking/custom_tracker.yaml
+# Production tuning for wide-angle CCTV office spaces with heavy occlusions
+
+tracker_type: bytetrack
+
+
+track_low_thresh: 0.05    # Low-bar tracking safety net to hold on to people behind cubicle dividers
+new_track_thresh: 0.55    # Was 0.45 — chair shadows rarely hit 55% confidence
+track_high_thresh: 0.35   # Slightly higher bar for high-quality matching
+
+track_buffer: 550         # Keeps IDs alive for 10 seconds if they duck out of view
+
+# --- THE ACCELERATING MOTION & ID SWITCH FIX ---
+# Easing the match threshold allows the tracking system to maintain lock 
+# even when a person walks toward the camera and their box size shifts quickly.
+match_thresh: 0.98        
+fuse_score: True
+
