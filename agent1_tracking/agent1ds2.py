@@ -49,7 +49,7 @@ print(f"[INFO] Writing detections to database every frame...")
 # --- SET UP OUTPUT VIDEO FOR VISUAL VERIFICATION ---
 output_dir = os.path.join(ROOT_DIR, "output_videos")
 os.makedirs(output_dir, exist_ok=True)
-output_path = os.path.join(output_dir, "output_agent1_final(2).mp4")
+output_path = os.path.join(output_dir, "Tracking_No_Violations.mp4")
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 video_writer = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
@@ -81,21 +81,30 @@ while True:
         frame,
         persist=True,
         tracker="agent1_tracking/custom_tracker.yaml",
-        classes=[0],    # Only detect people (class 0 in COCO dataset)
-        iou=0.20,       # Aggressively merge overlapping boxes (kills chair doubles)
-        imgsz=1536,     # Higher resolution scan to catch far-away people
-        verbose=False   # Suppress YOLO's built-in console spam
+        classes=[0, 67],   # 0 = people, 67 = cell phones (COCO class)
+        conf=0.25,
+        iou=0.30,
+        imgsz=1536,
+        augment=True,      # <--- ADDED: Helps catch faint/occluded people
+        verbose=False
     )
 
     frame_results = results[0]
+
+    # --- TRACK ACTIVE PEOPLE IDs FOR LOGGING ---
+    active_people_ids = set()
 
     if frame_results.boxes.id is not None:
         raw_ids     = frame_results.boxes.id.int().tolist()
         boxes       = frame_results.boxes.xyxy.int().tolist()
         confidences = frame_results.boxes.conf.tolist()
+        classes     = frame_results.boxes.cls.int().tolist()
 
-        # --- PHASE 1: UPDATE PROBATION COUNTERS WITH GRACE PERIOD ---
-        for raw_id in raw_ids:
+        # --- PHASE 1: UPDATE PROBATION COUNTERS WITH GRACE PERIOD (PEOPLE ONLY) ---
+        for raw_id, cls in zip(raw_ids, classes):
+            if cls != 0:  # Skip phones for tracking
+                continue
+                
             # If seen recently within the grace period, increment count. Otherwise, reset.
             if raw_id in last_seen_frame and (frame_count - last_seen_frame[raw_id]) <= GRACE_PERIOD_FRAMES:
                 raw_id_counters[raw_id] = raw_id_counters.get(raw_id, 0) + 1
@@ -110,15 +119,42 @@ while True:
                 id_registry[raw_id] = next_clean_id
                 next_clean_id += 1
                 print(f"[NEW PERSON] Person ID {id_registry[raw_id]} confirmed.")
-        # --- PHASE 2: WRITE CONFIRMED DETECTIONS TO DATABASE + VIDEO ---
-        for raw_id, box, conf in zip(raw_ids, boxes, confidences):
-            if raw_id in id_registry:
-                clean_id = id_registry[raw_id]
+        
+        # --- PHASE 2: PROCESS ALL DETECTIONS (PEOPLE + PHONES) ---
+        for raw_id, box, conf, cls in zip(raw_ids, boxes, confidences, classes):
+            
+            # --- CASE 1: PHONE DETECTION (class 67) - YELLOW BBOX ---
+            if cls == 67 and conf >= 0.25:
                 x1, y1, x2, y2 = box
-                # Write one detection row per confirmed person per frame.
-                # Agent 2 reads these rows and applies its desk-absence rules.
-                # Agent 3 fills vlm_summary later.
-                # Agent 2 fills duration_seconds and crop_path later.
+                
+                cursor.execute("""
+                    INSERT INTO events
+                        (timestamp, person_id, event_type, confidence,
+                         bbox_x1, bbox_y1, bbox_x2, bbox_y2)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    round(current_timestamp, 3),
+                    None,  # No person_id for phones
+                    "phone_detected",
+                    round(conf, 4),
+                    x1, y1, x2, y2
+                ))
+                
+                # --- YELLOW BOUNDING BOX (same style, yellow color) ---
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 1)  # Yellow
+                label = "PHONE"
+                (txt_w, txt_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+                cv2.rectangle(frame, (x1, y1 - txt_h - 6), (x1 + txt_w + 4, y1), (0, 255, 255), -1)
+                cv2.putText(frame, label, (x1 + 2, y1 - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+            
+            # --- CASE 2: PERSON DETECTION (class 0) - GREEN BBOX ---
+            elif cls == 0 and raw_id in id_registry:
+                clean_id = id_registry[raw_id]
+                active_people_ids.add(clean_id)
+
+                x1, y1, x2, y2 = box
+
                 cursor.execute("""
                     INSERT INTO events
                         (timestamp, person_id, event_type, confidence,
@@ -132,19 +168,21 @@ while True:
                     x1, y1, x2, y2
                 ))
 
-                # Draw clean green bounding box and ID label on the frame
-               
+                # --- GREEN BOUNDING BOX ---
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 1)
                 label = f"ID:{clean_id}"
                 (txt_w, txt_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
                 cv2.rectangle(frame, (x1, y1 - txt_h - 6), (x1 + txt_w + 4, y1), (0, 255, 0), -1)
                 cv2.putText(frame, label, (x1 + 2, y1 - 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+    
     # Commit to database every 30 frames to avoid hammering the disk
     if frame_count % 30 == 0:
         conn.commit()
+        # --- UPDATED LOG: Shows people currently in frame + total confirmed ---
         print(f" -> Frame {frame_count}/{total_frames} | "
-              f"People confirmed: {list(id_registry.values())}")
+              f"Active: {sorted(active_people_ids)} | "
+              f"Total confirmed: {list(id_registry.values())}")
 
     # Write annotated frame to output video
     video_writer.write(frame)

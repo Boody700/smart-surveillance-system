@@ -49,7 +49,7 @@ print(f"[INFO] Writing detections to database every frame...")
 # --- SET UP OUTPUT VIDEO FOR VISUAL VERIFICATION ---
 output_dir = os.path.join(ROOT_DIR, "output_videos")
 os.makedirs(output_dir, exist_ok=True)
-output_path = os.path.join(output_dir, "output_agent1_final(2).mp4")
+output_path = os.path.join(output_dir, "Tracking_No_Violations.mp4")
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 video_writer = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
@@ -81,10 +81,11 @@ while True:
         frame,
         persist=True,
         tracker="agent1_tracking/custom_tracker.yaml",
-        classes=[0],    # Only detect people (class 0 in COCO dataset)
-        iou=0.20,       # Aggressively merge overlapping boxes (kills chair doubles)
-        imgsz=1536,     # Higher resolution scan to catch far-away people
-        verbose=False   # Suppress YOLO's built-in console spam
+        classes=[0],
+        conf=0.25,       # Bumped slightly to reduce low-conf shape-shifting
+        iou=0.30,        # Standard IOU for ByteTrack
+        imgsz=1536,
+        verbose=False
     )
 
     frame_results = results[0]
@@ -110,15 +111,16 @@ while True:
                 id_registry[raw_id] = next_clean_id
                 next_clean_id += 1
                 print(f"[NEW PERSON] Person ID {id_registry[raw_id]} confirmed.")
+        
         # --- PHASE 2: WRITE CONFIRMED DETECTIONS TO DATABASE + VIDEO ---
         for raw_id, box, conf in zip(raw_ids, boxes, confidences):
             if raw_id in id_registry:
                 clean_id = id_registry[raw_id]
+
+                # --- FIX: Extract box coordinates BEFORE using them ---
                 x1, y1, x2, y2 = box
+
                 # Write one detection row per confirmed person per frame.
-                # Agent 2 reads these rows and applies its desk-absence rules.
-                # Agent 3 fills vlm_summary later.
-                # Agent 2 fills duration_seconds and crop_path later.
                 cursor.execute("""
                     INSERT INTO events
                         (timestamp, person_id, event_type, confidence,
@@ -133,13 +135,13 @@ while True:
                 ))
 
                 # Draw clean green bounding box and ID label on the frame
-               
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 1)
                 label = f"ID:{clean_id}"
                 (txt_w, txt_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
                 cv2.rectangle(frame, (x1, y1 - txt_h - 6), (x1 + txt_w + 4, y1), (0, 255, 0), -1)
                 cv2.putText(frame, label, (x1 + 2, y1 - 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+    
     # Commit to database every 30 frames to avoid hammering the disk
     if frame_count % 30 == 0:
         conn.commit()
