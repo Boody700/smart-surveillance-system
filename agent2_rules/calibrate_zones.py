@@ -30,10 +30,7 @@ def mouse_click(event, x, y, flags, param):
             cv2.fillPoly(frame_display.copy(), [pts], (0, 255, 0))
             
             h, w = frame_display.shape[:2]
-            normalized = [
-                current_points[0][0]/w, current_points[0][1]/h,
-                current_points[2][0]/w, current_points[2][1]/h
-            ]
+            normalized = [[p[0]/w, p[1]/h] for p in current_points]
             zones.append(normalized)
             print(f"Zone {len(zones)} saved: {normalized}")
             current_points.clear()

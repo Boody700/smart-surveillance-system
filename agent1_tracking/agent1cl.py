@@ -48,7 +48,7 @@ print(f"[INFO] Writing detections to database every frame...")
 # --- SET UP OUTPUT VIDEO FOR VISUAL VERIFICATION ---
 output_dir = os.path.join(ROOT_DIR, "output_videos")
 os.makedirs(output_dir, exist_ok=True)
-output_path = os.path.join(output_dir, "Phone and afk output.mp4")
+output_path = os.path.join(output_dir, "afk output.mp4")
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 video_writer = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
