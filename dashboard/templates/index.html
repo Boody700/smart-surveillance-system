@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AI Video Processing Dashboard</title>
+</head>
+
+<body>
+
+<h1>AI Monitoring System</h1>
+
+<!-- UPLOAD -->
+<input type="file" id="videoInput">
+<button onclick="uploadVideo()">Upload</button>
+
+<br><br>
+
+<button onclick="startProcessing()">▶ Start Processing</button>
+
+<h3 id="status">Idle</h3>
+
+<hr>
+
+<!-- LIVE FRAME VIEW (simple placeholder for now) -->
+<h2>Processing View</h2>
+
+<canvas id="canvas" width="800"></canvas>
+
+<hr>
+
+<h2>Events (Live DB)</h2>
+<div id="events"></div>
+
+<script>
+
+async function uploadVideo() {
+    const file = document.getElementById("videoInput").files[0];
+    const formData = new FormData();
+    formData.append("video", file);
+
+    await fetch("/upload", {
+        method: "POST",
+        body: formData
+    });
+
+    alert("Uploaded");
+}
+
+async function startProcessing() {
+    await fetch("/start", {method: "POST"});
+    monitorStatus();
+    loadEvents();
+}
+
+async function monitorStatus() {
+    setInterval(async () => {
+        const res = await fetch("/status");
+        const data = await res.json();
+        document.getElementById("status").innerText =
+            data.processing ? "Processing..." : "Stopped";
+    }, 1000);
+}
+
+async function loadEvents() {
+    setInterval(async () => {
+        const res = await fetch("/api/events");
+        const data = await res.json();
+
+        document.getElementById("events").innerHTML =
+            data.slice(0, 10).map(e =>
+                `<div>${e.timestamp} | ID:${e.person_id} | ${e.event_type}</div>`
+            ).join("");
+
+    }, 1000);
+}
+
+</script>
+
+</body>
+</html>
