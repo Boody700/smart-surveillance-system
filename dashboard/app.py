@@ -381,6 +381,7 @@ hr { border-color: #1c2636; margin: 1.5rem 0; }
 # passwords (e.g. streamlit-authenticator) before this guards anything real.
 AUTH_USERS = {
     "admin": "123",
+    "gamal" : "Jimmy"
 }
 
 if "authenticated" not in st.session_state:
@@ -441,6 +442,40 @@ st.markdown("""
     <div class="hero-sub">FEED.IN &rarr; TRACK.PERSON &rarr; FLAG.VIOLATION &rarr; REPORT.OUT</div>
 </div>
 """, unsafe_allow_html=True)
+
+# ── VIDEO SOURCE (persistent, shown above all tabs) ───────────────────────────
+# Deliberately NOT nested inside a tab: whichever video is picked here is what
+# both "Calibrate Zones" and "Run Detection" use, in whatever order you visit
+# them — you're never blocked from calibrating just because you haven't run
+# detection yet, and never blocked from detecting just because you haven't
+# calibrated. Zones are optional for Agent 1 either way; they only matter once
+# Agent 2 runs.
+src_col1, src_col2 = st.columns([2.2, 1], gap="large")
+with src_col1:
+    uploaded = st.file_uploader(
+        "Video source — used by both Calibrate Zones and Run Detection",
+        type=["mp4", "avi", "mov", "mkv"],
+    )
+    if uploaded:
+        vdir = os.path.join(ROOT_DIR, "videos")
+        os.makedirs(vdir, exist_ok=True)
+        vpath = os.path.join(vdir, uploaded.name)
+        with open(vpath, "wb") as f:
+            f.write(uploaded.getbuffer())
+        st.session_state["video_path"] = vpath
+
+with src_col2:
+    active_video = st.session_state.get("video_path", VIDEO_PATH)
+    st.markdown(
+        f'<div style="font-family:\'JetBrains Mono\',monospace;font-size:0.78rem;'
+        f'color:#5b6b82;margin-top:1.9rem;">'
+        f'SOURCE &rarr;<br><span style="color:#a5b4fc;">{os.path.basename(active_video)}</span>'
+        f'{"<br>(default — nothing uploaded yet)" if "video_path" not in st.session_state else ""}'
+        f'</div>',
+        unsafe_allow_html=True
+    )
+
+st.markdown("<br>", unsafe_allow_html=True)
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 def get_stats():
@@ -573,9 +608,9 @@ def run_agent_with_progress(script_path, progress_bar, readout_placeholder,
     return process.returncode, lines
 
 # ── TABS ──────────────────────────────────────────────────────────────────────
-tab0, tab1, tab2, tab3 = st.tabs([
-    "  🗺️  Calibrate Zones  ",
+tab1, tab0, tab2, tab3 = st.tabs([
     "  📹  Step 1 — Run Detection  ",
+    "  🗺️  Calibrate Zones  ",
     "  🚨  Step 2 — View Violations  ",
     "  📄  Step 3 — Report  "
 ])
@@ -602,7 +637,7 @@ with tab0:
     else:
         calib_video = st.session_state.get("video_path", VIDEO_PATH)
         if not os.path.exists(calib_video):
-            st.warning("Upload a video in Step 1 first, or make sure the default video in config.py exists.")
+            st.warning("Upload a video in the box above first, or make sure the default video in config.py exists.")
         else:
             cap = cv2.VideoCapture(calib_video)
             ok, frame_bgr = cap.read()
@@ -696,35 +731,6 @@ with tab1:
     left, right = st.columns([1, 1.6], gap="large")
 
     with left:
-        st.markdown("#### Upload your video")
-        uploaded = st.file_uploader(
-            "Drag & drop or click to browse",
-            type=["mp4", "avi", "mov", "mkv"],
-            label_visibility="collapsed"
-        )
-
-        if uploaded:
-            vdir = os.path.join(ROOT_DIR, "videos")
-            os.makedirs(vdir, exist_ok=True)
-            vpath = os.path.join(vdir, uploaded.name)
-            with open(vpath, "wb") as f:
-                f.write(uploaded.getbuffer())
-            st.session_state["video_path"] = vpath
-            st.success(f"✓ {uploaded.name}")
-            st.video(uploaded)
-
-        active_video = st.session_state.get("video_path", VIDEO_PATH)
-        st.markdown(
-            f'<div style="font-family:\'JetBrains Mono\',monospace;font-size:0.72rem;'
-            f'color:#5b6b82;margin-top:0.4rem;">'
-            f'SOURCE &rarr; <span style="color:#a5b4fc;">{os.path.basename(active_video)}</span>'
-            f'{" (default)" if "video_path" not in st.session_state else ""}'
-            f'</div>',
-            unsafe_allow_html=True
-        )
-
-        st.markdown("<hr>", unsafe_allow_html=True)
-
         # Pipeline steps
         agent1_done = st.session_state.get("agent1_done", False)
         st.markdown(f"""

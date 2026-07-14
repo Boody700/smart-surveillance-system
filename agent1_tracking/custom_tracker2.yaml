@@ -20,9 +20,9 @@ tracker_type: botsort
 
 track_high_thresh: 0.1      # first-pass association confidence floor
 track_low_thresh: 0.1       # second-pass association confidence floor
-new_track_thresh: 0.8       # confidence needed to spawn a brand-new track
+new_track_thresh: 0.3      # confidence needed to spawn a brand-new track
 track_buffer: 60            # frames to keep a lost track alive before dropping it
-match_thresh: 0.95          # IOU matching threshold
+match_thresh: 0.8          # IOU matching threshold
 fuse_score: True            # blend detection confidence into the match cost
 
 # ── BoT-SORT camera-motion compensation ───────────────────────────────────────

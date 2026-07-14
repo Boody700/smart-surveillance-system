@@ -11,4 +11,4 @@ DATABASE_PATH = os.path.join(ROOT_DIR, "database", "hfdb.db")
 # Other settings
 VIDEO_PATH = os.path.join(ROOT_DIR, "videos", "Chaos.mp4")
 CROPS_DIR = os.path.join(ROOT_DIR, "crops")
-MODEL_NAME = "yolo12n.pt"
+MODEL_NAME = "yolo12s.pt"

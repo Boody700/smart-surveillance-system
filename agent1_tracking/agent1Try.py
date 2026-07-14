@@ -12,9 +12,12 @@
 import os
 import sys
 import cv2
+import json
 import sqlite3
 import numpy as np
 from ultralytics import YOLO
+import time
+
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT_DIR)
@@ -22,7 +25,32 @@ sys.path.append(ROOT_DIR)
 from config import VIDEO_PATH as DEFAULT_VIDEO_PATH, MODEL_NAME, DATABASE_PATH
 
 FACE_MODEL_PATH  = os.path.join(ROOT_DIR, "face_detection_model.pt")
-PHONE_MODEL_PATH = os.path.join(ROOT_DIR, "Phone_best.pt")
+PHONE_MODEL_PATH = os.path.join(ROOT_DIR, "best_phone.pt")
+
+# ── ZONE DATA (for zone-anchored identity reconciliation) ─────────────────────
+# Loaded here too (not just in Agent 2) so the offline reconciliation pass can
+# use "did this person come back to the SAME physical desk" as independent
+# evidence on top of appearance — for a fixed-workstation setup, that's a much
+# stronger signal than clothing similarity alone.
+ZONES_JSON_PATH = os.path.join(os.path.dirname(DATABASE_PATH), "zones.json")
+
+def _load_zones_norm():
+    if not os.path.exists(ZONES_JSON_PATH):
+        return []
+    try:
+        with open(ZONES_JSON_PATH) as f:
+            return json.load(f).get("zones", [])
+    except Exception:
+        return []
+
+_ZONES_NORM = _load_zones_norm()
+
+def _zone_for_point(cx, cy, zones_norm, fw, fh):
+    for zi, zone in enumerate(zones_norm):
+        poly = np.array([[p[0] * fw, p[1] * fh] for p in zone], dtype=np.float32)
+        if cv2.pointPolygonTest(poly, (float(cx), float(cy)), False) >= 0:
+            return zi
+    return None
 
 # Video path can be overridden from the command line (e.g. by app.py passing
 # the uploaded file's path). Falls back to config.py's default otherwise.
@@ -55,10 +83,22 @@ frame_height = int(video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
 print(f"[INFO] Video: {total_frames} frames @ {fps:.2f} FPS  "
       f"({frame_width}x{frame_height})")
 
+# Zone polygons in pixel space, precomputed once — drawn on every frame below
+# (live preview + saved output video), so you can see calibrated zones during
+# processing, not just after the fact.
+_ZONES_PX = [
+    [(int(p[0] * frame_width), int(p[1] * frame_height)) for p in zone]
+    for zone in _ZONES_NORM
+]
+if _ZONES_PX:
+    print(f"[INFO] {len(_ZONES_PX)} calibrated zone(s) loaded — will be drawn on every frame.")
+else:
+    print("[INFO] No zones.json found (or it's empty) — no zone overlay will be drawn.")
+
 # ── OUTPUT VIDEO ──────────────────────────────────────────────────────────────
 output_dir  = os.path.join(ROOT_DIR, "output_videos")
 os.makedirs(output_dir, exist_ok=True)
-output_path = os.path.join(output_dir, "agent1_output.mp4")
+output_path = os.path.join(output_dir, "agent1_output3.mp4")
 fourcc      = cv2.VideoWriter_fourcc(*'mp4v')
 video_writer = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
@@ -105,9 +145,16 @@ last_known_hist  = {}   # clean_id -> HSV clothing histogram — appearance Re-I
 id_hist_sum   = {}   # clean_id -> running sum of HSV histograms across the full track
 id_hist_count = {}   # clean_id -> number of histograms summed
 id_frame_set  = {}   # clean_id -> set of frame_counts where this ID was seen
+id_zone_votes = {}   # clean_id -> {zone_index: frame_count} — for home-zone detection
+id_first_seen = {}   # clean_id -> frame_count when first confirmed — home-zone
+                       # votes only count within a warmup window after this,
+                       # so a LATER unauthorized-zone violation can never
+                       # corrupt where someone actually started/belongs.
+HOME_ZONE_WARMUP_SECONDS = 20  # matches Agent 2's WARMUP_SECONDS concept
+HOME_ZONE_WARMUP_FRAMES  = int(fps * HOME_ZONE_WARMUP_SECONDS) if fps else 600
 
 GRACE_PERIOD_FRAMES   = 45
-MIN_FRAMES_TO_CONFIRM = 30
+MIN_FRAMES_TO_CONFIRM = 50
 REID_DISTANCE_THRESH  = 250   # px — raise if Re-ID misses, lower if it merges people
 
 # Motion-validity gate — filters out static false-positive "people" (furniture,
@@ -357,6 +404,16 @@ while True:
                 id_hist_count[clean_id] = id_hist_count.get(clean_id, 0) + 1
             id_frame_set.setdefault(clean_id, set()).add(frame_count)
 
+            if _ZONES_NORM:
+                if clean_id not in id_first_seen:
+                    id_first_seen[clean_id] = frame_count
+                if (frame_count - id_first_seen[clean_id]) <= HOME_ZONE_WARMUP_FRAMES:
+                    pcx, pcy = get_center(box)
+                    zone_idx = _zone_for_point(pcx, pcy, _ZONES_NORM, frame_width, frame_height)
+                    if zone_idx is not None:
+                        votes = id_zone_votes.setdefault(clean_id, {})
+                        votes[zone_idx] = votes.get(zone_idx, 0) + 1
+
             cursor.execute("""
                 INSERT INTO events
                     (timestamp, person_id, event_type, confidence,
@@ -379,7 +436,7 @@ while True:
     if phone_model is not None:
         res_phones = phone_model.predict(
             frame,
-            conf=0.25,           # custom model — start moderate, tune after testing
+            conf=0.40,           # custom model — start moderate, tune after testing
             iou=0.30,
             imgsz=1280,           # phones are small objects — resolution is the
                                   # single biggest lever here, worth the extra
@@ -390,7 +447,7 @@ while True:
         res_phones = model_main.predict(
             frame,
             classes=[67],
-            conf=0.12,
+            conf=0.40,
             iou=0.30,
             imgsz=1280,
             verbose=False
@@ -439,7 +496,7 @@ while True:
     if face_model is not None:
         res_faces = face_model.predict(
             frame,
-            conf=0.40,          # faces — keep reasonable threshold
+            conf=0.50,          # faces — keep reasonable threshold
             iou=0.40,
             imgsz=960,
             verbose=False
@@ -493,6 +550,17 @@ while True:
                 cv2.putText(frame, flabel, (fx1 + 3, fy1 - 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
+    # ── DRAW CALIBRATED ZONES ─────────────────────────────────────────────────
+    # Drawn last, on top of the person/phone/face boxes, so you can see zone
+    # boundaries during processing itself — not just after the fact in Agent 2.
+    for zi, zone_px in enumerate(_ZONES_PX):
+        pts = np.array(zone_px, dtype=np.int32)
+        cv2.polylines(frame, [pts], True, (99, 102, 241), 2)  # indigo — matches the app's zone color
+        zx = int(np.mean(pts[:, 0])) - 30
+        zy = int(np.mean(pts[:, 1]))
+        cv2.putText(frame, f"Zone {zi}", (zx, zy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (99, 102, 241), 2)
+
     # ── PROGRESS LOG ─────────────────────────────────────────────────────────
     if frame_count % 30 == 0:
         conn.commit()
@@ -529,12 +597,32 @@ while True:
 # This does not cap or assume a known number of people — it will correctly
 # leave distinct people unmerged, and will correctly merge fragments of the
 # same person however many tracks they were split into.
-MERGE_APPEARANCE_THRESHOLD = 0.65
+MERGE_APPEARANCE_THRESHOLD      = 0.65   # default bar — appearance alone
+ZONE_MERGE_APPEARANCE_THRESHOLD = 0.40   # looser bar — used ONLY when both
+                                          # candidates share a home zone.
+                                          # "Same clothing AND same physical
+                                          # desk" needs far less appearance
+                                          # certainty than clothing alone —
+                                          # this is what makes a person
+                                          # returning to their own desk, after
+                                          # any absence length, reliably stick
+                                          # to one ID even if their appearance
+                                          # shifted (lighting, pose, partial
+                                          # occlusion) enough to miss the
+                                          # stricter default bar.
 
 def _average_hist(cid):
     if id_hist_count.get(cid, 0) == 0:
         return None
     return id_hist_sum[cid] / id_hist_count[cid]
+
+def _home_zone(cid):
+    """Zone this ID spent the most time in, across its whole track. None if
+    it was never seen inside any calibrated zone."""
+    votes = id_zone_votes.get(cid)
+    if not votes:
+        return None
+    return max(votes, key=votes.get)
 
 all_confirmed_ids = sorted(set(id_registry.values()))
 parent = {cid: cid for cid in all_confirmed_ids}
@@ -561,17 +649,23 @@ for i, id_a in enumerate(all_confirmed_ids):
         score = cv2.compareHist(
             hist_a.astype(np.float32), hist_b.astype(np.float32), cv2.HISTCMP_CORREL
         )
-        if score >= MERGE_APPEARANCE_THRESHOLD:
+
+        home_a, home_b = _home_zone(id_a), _home_zone(id_b)
+        same_zone = home_a is not None and home_a == home_b
+        threshold = ZONE_MERGE_APPEARANCE_THRESHOLD if same_zone else MERGE_APPEARANCE_THRESHOLD
+
+        if score >= threshold:
             root_a, root_b = _find_root(id_a), _find_root(id_b)
             keep, drop = (root_a, root_b) if root_a < root_b else (root_b, root_a)
             parent[drop] = keep
-            merge_log.append((drop, keep, score))
+            merge_log.append((drop, keep, score, same_zone, home_a if same_zone else None))
 
 if merge_log:
     print("\n[IDENTITY RECONCILIATION] Merging fragmented tracks:")
-    for drop, keep, score in merge_log:
+    for drop, keep, score, same_zone, zone_idx in merge_log:
+        zone_note = f", same home zone={zone_idx}" if same_zone else ""
         print(f"  Person {drop} -> Person {keep}  "
-              f"(full-track appearance correlation={score:.2f}, never co-present)")
+              f"(full-track appearance correlation={score:.2f}, never co-present{zone_note})")
 
     # Durable audit trail — records WHAT got merged into WHAT and WHY, so the
     # correction is provable rather than a silent overwrite. Query this table
@@ -582,14 +676,18 @@ if merge_log:
             dropped_track_id     INTEGER,
             canonical_person_id  INTEGER,
             appearance_score     REAL,
+            same_home_zone       INTEGER,
+            matching_zone_index  INTEGER,
             merged_at_timestamp  TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    for drop, keep, score in merge_log:
+    for drop, keep, score, same_zone, zone_idx in merge_log:
         cursor.execute("""
-            INSERT INTO identity_merges (dropped_track_id, canonical_person_id, appearance_score)
-            VALUES (?, ?, ?)
-        """, (drop, keep, round(float(score), 4)))
+            INSERT INTO identity_merges
+                (dropped_track_id, canonical_person_id, appearance_score,
+                 same_home_zone, matching_zone_index)
+            VALUES (?, ?, ?, ?, ?)
+        """, (drop, keep, round(float(score), 4), int(same_zone), zone_idx))
 
     for cid in all_confirmed_ids:
         root = _find_root(cid)
