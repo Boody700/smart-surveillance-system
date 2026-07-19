@@ -1,46 +1,23 @@
 # agent1_tracking/custom_tracker.yaml
 # BoT-SORT tracker config, with ReID enabled at the association step itself.
-#
-# WHY THIS OVER BYTETRACK: ByteTrack's frame-to-frame association is pure
-# motion/IOU — it has no appearance awareness, which is exactly why two
-# people crossing paths or standing close together can get their identities
-# swapped mid-track. BoT-SORT extends the same core tracker with an optional
-# appearance check (with_reid) baked directly into matching, which is the
-# actual fix for that failure mode — our own custom Re-ID/reconciliation code
-# only ever runs when a NEW raw_id appears, so it structurally can't catch a
-# swap that happens without any track ever dropping.
-#
-# NOTE ON VERSIONING: these values match the current default botsort.yaml
-# shipped with Ultralytics as of this writing. If your installed version
-# differs, compare against your own copy — find it with:
-#   python -c "import ultralytics, os; print(os.path.join(os.path.dirname(ultralytics.__file__), 'cfg/trackers/botsort.yaml'))"
-# and prefer your installed version's values for anything not called out below.
-
 tracker_type: botsort
 
-track_high_thresh: 0.1      # first-pass association confidence floor
-track_low_thresh: 0.1       # second-pass association confidence floor
-new_track_thresh: 0.3      # confidence needed to spawn a brand-new track
-track_buffer: 60            # frames to keep a lost track alive before dropping it
-match_thresh: 0.8          # IOU matching threshold
-fuse_score: True            # blend detection confidence into the match cost
-
-# ── BoT-SORT camera-motion compensation ───────────────────────────────────────
-# Your camera is a fixed CCTV-style mount, not handheld/drone footage, so this
-# compensation step is pure overhead for you. Setting it to "none" saves
-# compute versus the default "sparseOptFlow" — flip back only if the camera
-# ever shakes, pans, or gets bumped.
+track_high_thresh: 0.3
+track_low_thresh: 0.3
+new_track_thresh: 0.6
+track_buffer: 300
+match_thresh: 0.9
+fuse_score: True
 gmc_method: none
 
-# ── ReID — the actual identity-switch fix ─────────────────────────────────────
 with_reid: True
-model: auto                 # reuses YOLO's own detector features for
-                             # appearance — minimal extra cost, no separate
-                             # model download. Swap to a dedicated ReID
-                             # checkpoint later only if this isn't discriminative
-                             # enough (uniforms / very similar clothing).
-proximity_thresh: 0.5       # only compare appearance for candidates that are
-                             # already spatially close — this is what keeps
-                             # cost down (no point comparing appearance for
-                             # someone across the room)
-appearance_thresh: 0.25     # minimum appearance similarity to accept a match
+model: auto
+proximity_thresh: 0.2   # LOWERED from 0.5 — this gates WHEN appearance is even
+                          # consulted. At 0.5, two people standing close/behind
+                          # each other but not fully overlapping never triggered
+                          # the appearance check, falling back to pure motion/IOU
+                          # cost — exactly where a proximity swap happens.
+appearance_thresh: 0.45  # RAISED from 0.35 — firmer bar now that appearance
+                          # gets consulted more often, so it doesn't accept a
+                          # weak/ambiguous match just because it's being asked
+                          # more frequently.

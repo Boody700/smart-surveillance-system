@@ -174,7 +174,7 @@ while True:
         persist=True,
         tracker="agent1_tracking/custom_tracker.yaml",
         classes=[0],            # people only
-        conf=0.25,
+        conf=0.30,
         iou=0.30,
         imgsz=960,
         verbose=False
