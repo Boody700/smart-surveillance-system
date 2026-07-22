@@ -1,23 +1,53 @@
 # agent1_tracking/custom_tracker.yaml
-# BoT-SORT tracker config, with ReID enabled at the association step itself.
+# Production tuning for wide-angle CCTV office spaces with heavy occlusions.
+#
+# SWITCHED FROM BYTETRACK TO BOT-SORT: ByteTrack has NO appearance signal —
+# it matches tracks purely by motion/IOU (Kalman filter + box overlap). That
+# is exactly why two people crossing paths or standing close/behind each
+# other can get their identities swapped: nothing in the matching step
+# itself checks "does this still look like the same person." BoT-SORT with
+# with_reid=True adds an appearance check directly into that matching
+# decision, which is the actual structural fix. Everything else below keeps
+# your original CCTV/occlusion-friendly tuning.
+
 tracker_type: botsort
 
-track_high_thresh: 0.3
-track_low_thresh: 0.3
-new_track_thresh: 0.6
+# Same reasoning as your original comments — lowered so partially occluded
+# people (torso behind a laptop, upper body only) still enter the
+# high-confidence pool; chairs/shadows rarely stay this confident.
+new_track_thresh: 0.40
+track_high_thresh: 0.30
+track_low_thresh: 0.05
+
+# ~10s at 30fps — long enough to survive a brief occlusion/detection gap,
+# not so long it starts wrongly absorbing a different person who later
+# stands in the same spot. Multi-minute absences are handled by the
+# Python-side face-gallery re-entry logic instead — no tracker buffer value
+# can safely bridge that without causing other problems.
 track_buffer: 300
-match_thresh: 0.9
+
+match_thresh: 0.85
 fuse_score: True
+
+# Fixed CCTV mount, not handheld/drone — this compensation step is pure
+# overhead for you. Flip back to sparseOptFlow only if the camera ever
+# shakes, pans, or gets bumped.
 gmc_method: none
 
+# ── ReID — the actual swap fix ────────────────────────────────────────────
 with_reid: True
-model: auto
-proximity_thresh: 0.2   # LOWERED from 0.5 — this gates WHEN appearance is even
-                          # consulted. At 0.5, two people standing close/behind
-                          # each other but not fully overlapping never triggered
-                          # the appearance check, falling back to pure motion/IOU
-                          # cost — exactly where a proximity swap happens.
-appearance_thresh: 0.45  # RAISED from 0.35 — firmer bar now that appearance
-                          # gets consulted more often, so it doesn't accept a
-                          # weak/ambiguous match just because it's being asked
-                          # more frequently.
+model: auto              # reuses YOLO's own detector features — no extra
+                          # model download, minimal added cost
+proximity_thresh: 0.2    # LOWERED from BoT-SORT's default 0.5 — this gates
+                          # WHEN appearance is even consulted. At the
+                          # default, two people standing close/behind each
+                          # other but not fully overlapping never triggered
+                          # the appearance check at all, falling back to
+                          # pure motion/IOU — exactly where your swaps
+                          # happen. Lower means appearance gets checked for
+                          # more borderline-close pairs, not just near-total
+                          # overlap.
+appearance_thresh: 0.40  # firmer bar than the 0.25 default now that
+                          # appearance is consulted more often, so it
+                          # doesn't accept a weak/ambiguous match just
+                          # because it's being asked more frequently

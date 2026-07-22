@@ -6,7 +6,7 @@ tracker_type: bytetrack
 # FIX: Lowered from 0.55 -> 0.35 so partially occluded people (torso behind
 #      a laptop, upper body only) can enter the high-confidence tracking pool.
 #      Chair shadows and bags rarely exceed 35% confidence consistently.
-new_track_thresh: 0.55
+new_track_thresh: 0.35
 
 # FIX: Lowered from 0.35 -> 0.25 so low-confidence sporadic detections of
 #      the occluded person still feed into ByteTrack's low-confidence pool
@@ -17,10 +17,10 @@ track_high_thresh: 0.35
 track_low_thresh: 0.05
 
 # Keeps IDs alive for ~10 seconds at 30fps if they duck out of view
-track_buffer: 550
+track_buffer: 500
 
 # --- THE ACCELERATING MOTION & ID SWITCH FIX ---
 # Easing the match threshold allows the tracking system to maintain lock
 # even when a person walks toward the camera and their box size shifts quickly.
-match_thresh: 0.98
+match_thresh: 0.95
 fuse_score: True

@@ -802,7 +802,7 @@ with tab1:
             if not os.path.exists(selected_video):
                 st.error("Please upload a video first.")
             else:
-                agent1_path = os.path.join(ROOT_DIR, "agent1_tracking", "agent1Try.py")
+                agent1_path = os.path.join(ROOT_DIR, "agent1_tracking", "agent1gamal.py")
                 if not os.path.exists(agent1_path):
                     st.error(f"agent1.py not found at {agent1_path}")
                 else:
@@ -995,27 +995,33 @@ with tab3:
     st.markdown("<hr>", unsafe_allow_html=True)
     st.markdown("#### Generate Report")
     st.markdown(
-        '<p style="color:#5b6b82;font-size:0.85rem;">Generates a PDF report summarising all tracked people, violations, and LLaVA verdicts.</p>',
+        '<p style="color:#5b6b82;font-size:0.85rem;">Generates a PDF report summarising all tracked people, violations, and LLaVA verdicts, with an LLM-written narrative synthesizing patterns per person.</p>',
         unsafe_allow_html=True
     )
 
     report_btn = st.button("📄  Generate PDF Report", use_container_width=False)
+
+    log4_box = st.empty()
+    log4_box.markdown(
+        '<div class="terminal" style="color:#1c2636;">Click Generate PDF Report to start...</div>',
+        unsafe_allow_html=True
+    )
+
     if report_btn:
         agent4_path = os.path.join(ROOT_DIR, "agent4_dashboard", "agent4.py")
         if os.path.exists(agent4_path):
-            with st.spinner("Generating report..."):
-                result = subprocess.run(
-                    [sys.executable, agent4_path],
-                    cwd=ROOT_DIR, capture_output=True, text=True
-                )
-            if result.returncode == 0:
+            # Streamed like Agents 1 & 2 rather than a silent subprocess.run -
+            # the per-person LLM narrative calls (llama3.1:8b via Ollama) take
+            # real time, so a static spinner gives no sense of progress.
+            code4, lines4 = run_agent(agent4_path, log4_box)
+
+            if code4 == 0:
                 st.success("✓ Report generated successfully.")
-                # Try to offer download if PDF exists
                 report_path = os.path.join(ROOT_DIR, "report.pdf")
                 if os.path.exists(report_path):
                     with open(report_path, "rb") as f:
                         st.download_button("⬇  Download PDF", f, file_name="surveillance_report.pdf", mime="application/pdf")
             else:
-                st.error(f"Report generation failed:\n{result.stderr}")
+                st.error("Agent 4 failed. Check the log above.")
         else:
             st.info("Agent 4 not set up yet. Wire your PDF generator to agent4_dashboard/agent4.py")

@@ -1,21 +1,31 @@
 # agent1_tracking/agent1.py
-# Agent 1: Full production pipeline — SPLIT DETECTION + FACE DETECTION
+# Agent 1: Full production pipeline — SPLIT DETECTION + FACE + POSE
 #
 # ── WHAT CHANGED IN THIS VERSION ──────────────────────────────────────────────
-# FACE-GALLERY RE-ENTRY MATCH (new): the face gallery + swap-correction system
-# was only ever consulted to fix swaps between people ALREADY active at the
-# same time. It was never consulted by find_matching_clean_id — the function
-# that decides whether a brand-new raw track (e.g. someone returning after a
-# multi-minute absence) is actually a known person returning. That's exactly
-# why short absences (seconds) kept re-matching fine via body embedding, but
-# a 3+ minute absence didn't: body appearance drifts with lighting/pose/angle
-# far more than a face does over that timescale, and nothing was checking the
-# face gallery for this decision at all. No tracker track_buffer value can
-# fix this either — a 3-minute gap is far beyond what any sane buffer could
-# bridge without causing wrong merges elsewhere; this has to be solved in the
-# Re-ID layer. At graduation time, a quick face check now runs on the
-# candidate box FIRST, against every known person's face gallery, before
-# falling back to body-embedding/HSV/position matching.
+# 1. TRACKER: BoT-SORT with with_reid=True (see custom_tracker.yaml).
+# 2. FACE-GALLERY RE-ENTRY: multi-sample averaged, margin-checked. FIXED
+#    this version: the margin was being computed only against OTHER
+#    ELIGIBLE candidates — when only one person was actually eligible
+#    (common, since everyone else active this frame gets excluded), the
+#    margin was meaningless (literally printed things like "margin=1.75",
+#    which is impossible for real cosine-similarity scores in [-1,1] unless
+#    there was no real second candidate at all). Margin is now computed
+#    against the best score in the WHOLE gallery population, including
+#    currently-active people — a strong resemblance to someone who's
+#    already on-screen elsewhere is still real ambiguity worth respecting.
+# 3. POSE ESTIMATION: yolov8n-pose classifies SLEEPING vs AWAKE from
+#    nose-vs-shoulder keypoint height. FIXED this version: previously always
+#    took keypoints[0] from the pose model's results on a padded crop — if a
+#    neighboring person leaked into the padding (exactly the close-contact
+#    scenario you care about most), their pose could get attributed to the
+#    wrong clean_id. Now picks the detection with the LARGEST bbox area in
+#    the crop (the actual subject should dominate a tightly-padded crop; a
+#    neighbor caught at the edge should be smaller). Also added console
+#    visibility (a running counter, same pattern as the face-check stats) —
+#    there was previously zero log trace that this was running at all.
+#
+# Position-based Re-ID, the motion-validity gate, zone-anchored home-zone
+# voting, and the offline Pass 4 identity reconciliation are all preserved.
 
 import os
 import sys
@@ -33,6 +43,7 @@ from config import VIDEO_PATH as DEFAULT_VIDEO_PATH, MODEL_NAME, DATABASE_PATH
 
 FACE_MODEL_PATH  = os.path.join(ROOT_DIR, "face_detection_model.pt")
 PHONE_MODEL_PATH = os.path.join(ROOT_DIR, "best_phone.pt")
+POSE_MODEL_NAME  = "yolov8n-pose.pt"
 
 # ── DEVICE SETUP ───────────────────────────────────────────────────────────────
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -68,7 +79,7 @@ def _zone_for_point(cx, cy, zones_norm, fw, fh):
 
 VIDEO_PATH = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_VIDEO_PATH
 
-print("\n=== AGENT 1 STARTING: SPLIT DETECTION + FACE (DEEP RE-ID + FACE GALLERY RE-ENTRY) ===")
+print("\n=== AGENT 1 STARTING: DETECTION + FACE + POSE (BOT-SORT REID) ===")
 print(f"[INFO] Video source: {VIDEO_PATH}"
       f"{'  (overridden via argv)' if len(sys.argv) > 1 else '  (from config.py default)'}")
 
@@ -108,7 +119,7 @@ else:
 # ── OUTPUT VIDEO ──────────────────────────────────────────────────────────────
 output_dir  = os.path.join(ROOT_DIR, "output_videos")
 os.makedirs(output_dir, exist_ok=True)
-output_path = os.path.join(output_dir, "agent1_output7.mp4")
+output_path = os.path.join(output_dir, "agent1_output9.mp4")
 fourcc      = cv2.VideoWriter_fourcc(*'mp4v')
 video_writer = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
@@ -136,6 +147,13 @@ if os.path.exists(PHONE_MODEL_PATH):
 else:
     print(f"[WARN] Phone model NOT found at {PHONE_MODEL_PATH} — falling back to COCO class 67 on main model.")
 
+pose_model = None
+try:
+    print(f"[INFO] Loading pose model          : {POSE_MODEL_NAME}")
+    pose_model = YOLO(POSE_MODEL_NAME)
+except Exception as e:
+    print(f"[WARN] Could not load pose model ({e}) — sleeping-pose detection disabled.")
+
 # ── DEEP APPEARANCE EMBEDDING MODEL ────────────────────────────────────────────
 EMBEDDING_REID_ENABLED = True
 EMBED_MODEL      = None
@@ -160,8 +178,7 @@ if EMBEDDING_REID_ENABLED:
             T.ToTensor(),
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
-        print("[INFO] Deep appearance embedding model (ResNet18) loaded — this is now "
-              "the primary Re-ID signal.")
+        print("[INFO] Deep appearance embedding model (ResNet18) loaded.")
     except Exception as e:
         print(f"[WARN] Could not load embedding model ({e}). "
               f"Falling back to HSV histogram appearance matching only.")
@@ -232,6 +249,67 @@ def compute_appearance_hist(frame, box):
     cv2.normalize(hist, hist)
     return hist
 
+# ── POSE / SLEEPING CLASSIFICATION ────────────────────────────────────────────
+POSE_CHECK_EVERY_N_FRAMES = 5
+POSE_CROP_IMGSZ           = 320
+POSE_CONF                 = 0.30
+POSE_KP_CONF_FLOOR        = 0.30
+SLEEP_HEAD_DROP_MARGIN_PX = 10
+
+KP_NOSE, KP_L_SHOULDER, KP_R_SHOULDER = 0, 5, 6
+
+_pose_stats = {'checked_boxes': 0, 'no_pose_found': 0, 'multi_pose_in_crop': 0,
+               'low_conf_skipped': 0, 'sleeping': 0, 'awake': 0}
+
+def classify_sleep_pose(kp_xy, kp_conf):
+    nose_conf = float(kp_conf[KP_NOSE])
+    ls_conf   = float(kp_conf[KP_L_SHOULDER])
+    rs_conf   = float(kp_conf[KP_R_SHOULDER])
+
+    if nose_conf < POSE_KP_CONF_FLOOR or (ls_conf < POSE_KP_CONF_FLOOR and rs_conf < POSE_KP_CONF_FLOOR):
+        return None, 0.0
+
+    shoulder_ys = []
+    if ls_conf >= POSE_KP_CONF_FLOOR:
+        shoulder_ys.append(float(kp_xy[KP_L_SHOULDER][1]))
+    if rs_conf >= POSE_KP_CONF_FLOOR:
+        shoulder_ys.append(float(kp_xy[KP_R_SHOULDER][1]))
+    mid_shoulder_y = float(np.mean(shoulder_ys))
+    nose_y = float(kp_xy[KP_NOSE][1])
+
+    used_confs = [c for c in (nose_conf, ls_conf, rs_conf) if c >= POSE_KP_CONF_FLOOR]
+    avg_conf = float(np.mean(used_confs))
+
+    if nose_y >= mid_shoulder_y - SLEEP_HEAD_DROP_MARGIN_PX:
+        return "SLEEPING", avg_conf
+    return "AWAKE", avg_conf
+
+def _pick_dominant_pose(res):
+    """FIXED: previously always used keypoints[0], the first detection in
+    the pose model's result. With a padded crop, a neighboring person can
+    leak in at the edge — exactly during close contact, the scenario this
+    whole system is trying to get right. Now picks the detection with the
+    LARGEST bbox area instead: the actual subject of a tightly-padded crop
+    should dominate it; a neighbor caught at the edge should be smaller.
+    Returns (kp_xy, kp_conf) for the chosen detection, or (None, None)."""
+    if res.keypoints is None or res.keypoints.xy is None or len(res.keypoints.xy) == 0:
+        return None, None
+
+    n = len(res.keypoints.xy)
+    if n > 1:
+        _pose_stats['multi_pose_in_crop'] += 1
+
+    if n == 1 or res.boxes is None or len(res.boxes) != n:
+        idx = 0
+    else:
+        areas = res.boxes.xywh[:, 2] * res.boxes.xywh[:, 3]
+        idx = int(torch.argmax(areas).item())
+
+    kp_xy = res.keypoints.xy[idx].cpu().numpy()
+    kp_conf = (res.keypoints.conf[idx].cpu().numpy()
+               if res.keypoints.conf is not None else np.ones(len(kp_xy)))
+    return kp_xy, kp_conf
+
 # ── TRACKING STATE ────────────────────────────────────────────────────────────
 raw_id_counters  = {}
 id_registry      = {}
@@ -280,7 +358,7 @@ ONLINE_ZONE_BOOST_ENABLED   = True
 ZONE_ONLINE_EMBEDDING_FLOOR = 0.55
 ZONE_ONLINE_MIN_VOTES       = 30
 
-# ── FACE-ANCHORED SWAP CORRECTION ─────────────────────────────────────────────
+# ── FACE-ANCHORED SWAP CORRECTION (live, between simultaneously active people) ─
 FACE_SWAP_CHECK_ENABLED       = True
 FACE_EMB_MIN_CONF_FOR_CHECK   = 0.65
 FACE_EMB_OWN_MATCH_FLOOR      = 0.45
@@ -294,32 +372,12 @@ FACE_GALLERY_MAX_SIZE          = 5
 FACE_GALLERY_DIVERSITY_MAX_SIM = 0.85
 last_known_face_gallery = {}
 
-# ── FACE-GALLERY RE-ENTRY MATCH (new) ─────────────────────────────────────────
-# See module docstring — this is what actually fixes "returns after minutes
-# as a new ID." Checked FIRST at graduation, before body embedding/HSV.
+# ── FACE-GALLERY RE-ENTRY MATCH (for long absences) ───────────────────────────
 FACE_REENTRY_CHECK_ENABLED = True
-FACE_REENTRY_MATCH_FLOOR   = 0.45   # same scale as FACE_EMB_OWN_MATCH_FLOOR —
-                                      # tune this first if re-entries are
-                                      # still missed or, conversely, if it
-                                      # starts matching the wrong person
-FACE_REENTRY_MIN_SAMPLES  = 3        # require at least this many face
-                                      # observations collected during
-                                      # probation before trusting a re-entry
-                                      # decision AT ALL — this is a one-shot,
-                                      # PERMANENT identity assignment, so a
-                                      # single noisy/bad-angle frame should
-                                      # never be allowed to decide it alone
-FACE_REENTRY_MARGIN       = 0.10     # best candidate must beat the SECOND-
-                                      # best candidate by at least this much.
-                                      # A close call between two people is
-                                      # exactly when a generic (non face-
-                                      # recognition) embedding is least
-                                      # trustworthy — ties fall through to
-                                      # body-based matching instead of
-                                      # guessing and potentially locking in
-                                      # a wrong identity forever.
-raw_face_embeddings = {}   # raw_id -> [face embeddings collected during
-                            # probation, one per frame a face was found]
+FACE_REENTRY_MATCH_FLOOR   = 0.45
+FACE_REENTRY_MIN_SAMPLES   = 3
+FACE_REENTRY_MARGIN        = 0.10
+raw_face_embeddings = {}
 
 def _face_gallery_best_sim(cid, face_emb):
     gallery = last_known_face_gallery.get(cid)
@@ -359,7 +417,6 @@ ROI_PADDING_RATIO           = 0.15
 PHONE_CROP_IMGSZ            = 640
 FACE_CROP_IMGSZ             = 320
 FACE_DETECT_EVERY_N_FRAMES  = 1
-FACE_HEAD_REGION_FRACTION   = 0.55
 
 best_face_conf = {}
 best_face_crop = {}
@@ -400,15 +457,6 @@ def _current_home_zone(cid, min_votes=ZONE_ONLINE_MIN_VOTES):
     return zone if count >= min_votes else None
 
 def try_capture_probation_face(frame, raw_id, box):
-    """
-    Called every frame during PROBATION (before a raw track is confirmed) to
-    opportunistically collect face evidence, one sample per frame a
-    confident face is found. Building several samples across the probation
-    window — instead of trusting whatever single frame happens to be
-    current at the exact moment of graduation — is what makes the re-entry
-    decision below resistant to a single bad-angle/lighting read, since
-    that decision is a ONE-SHOT, PERMANENT identity assignment.
-    """
     if face_model is None:
         return
     ex1, ey1, ex2, ey2 = expand_box(box, 0.15, frame_width, frame_height)
@@ -436,27 +484,13 @@ def try_capture_probation_face(frame, raw_id, box):
 
 def find_face_match_for_reentry(face_embeddings, exclude_cids=None):
     """
-    Checked FIRST at graduation time, before body embedding/HSV/position.
-    Averages ALL face samples collected during this raw track's probation
-    (via try_capture_probation_face) into one query vector, then compares
-    against every KNOWN person's face gallery.
-
-    Two safety requirements before committing to a match, both aimed at the
-    same risk — this is a PERMANENT, one-shot decision, so it shouldn't be
-    made on thin or ambiguous evidence:
-      1. At least FACE_REENTRY_MIN_SAMPLES face observations required —
-         a single frame's read is too fragile against a generic
-         (non face-recognition) embedding to decide someone's identity
-         forever.
-      2. The best-matching candidate must beat the SECOND-best candidate by
-         at least FACE_REENTRY_MARGIN — a close call between two people is
-         exactly when this embedding is least trustworthy. If it's
-         ambiguous, fall through to body-based matching instead of
-         guessing (which is a strictly safer default: worst case it makes
-         a new ID instead of silently corrupting someone else's).
-
-    Returns the matching clean_id, or None (falls back to body-based
-    matching, exactly as before).
+    FIXED margin computation: previously computed the margin only against
+    OTHER ELIGIBLE candidates, which is meaningless whenever only one person
+    happens to be eligible (common — everyone else active this frame gets
+    excluded). Now computes the margin against the best score across the
+    WHOLE gallery population, including currently-active people — a strong
+    resemblance to someone who's already on-screen is still real ambiguity,
+    even though they can't actually be assigned as the match.
     """
     if not FACE_REENTRY_CHECK_ENABLED or not last_known_face_gallery or not face_embeddings:
         return None
@@ -471,19 +505,24 @@ def find_face_match_for_reentry(face_embeddings, exclude_cids=None):
         return None
     query_emb = avg / norm
 
-    scores = []
+    all_scores = []
     for cid in last_known_face_gallery:
-        if cid in exclude_cids:
-            continue
         s = _face_gallery_best_sim(cid, query_emb)
         if s is not None:
-            scores.append((s, cid))
-    if not scores:
+            all_scores.append((s, cid))
+    if not all_scores:
         return None
+    all_scores.sort(reverse=True)
 
-    scores.sort(reverse=True)
-    best_score, best_cid = scores[0]
-    second_score = scores[1][0] if len(scores) > 1 else -1.0
+    eligible = [(s, cid) for s, cid in all_scores if cid not in exclude_cids]
+    if not eligible:
+        return None
+    best_score, best_cid = eligible[0]
+
+    # Best OTHER score in the whole population (excluded or not) — this is
+    # the real "how close was the runner-up" question, not just "how close
+    # was the runner-up among the few people who happened to be eligible."
+    second_score = next((s for s, cid in all_scores if cid != best_cid), -1.0)
     margin = best_score - second_score
 
     if best_score >= FACE_REENTRY_MATCH_FLOOR and margin >= FACE_REENTRY_MARGIN:
@@ -498,8 +537,6 @@ def find_face_match_for_reentry(face_embeddings, exclude_cids=None):
               f"body-based matching instead of guessing.")
 
     return None
-
-
 
 def find_matching_clean_id(avg_cx, avg_cy, frame, box, exclude_cids=None):
     exclude_cids = exclude_cids or set()
@@ -698,15 +735,11 @@ while True:
                 if surv_cid is not None and dup_cid is None:
                     id_registry[dup_raw_id] = surv_cid
                     print(f"  [DEDUP] raw_id={dup_raw_id} overlaps confirmed "
-                          f"raw_id={surv_raw_id} (same person, same frame) — "
-                          f"aliased to Person {surv_cid} instead of "
-                          f"tracking as a separate identity.")
+                          f"raw_id={surv_raw_id} — aliased to Person {surv_cid}.")
                 elif dup_cid is not None and surv_cid is None:
                     id_registry[surv_raw_id] = dup_cid
                     print(f"  [DEDUP] raw_id={surv_raw_id} overlaps confirmed "
-                          f"raw_id={dup_raw_id} (same person, same frame) — "
-                          f"aliased to Person {dup_cid} instead of "
-                          f"tracking as a separate identity.")
+                          f"raw_id={dup_raw_id} — aliased to Person {dup_cid}.")
                 is_dup = True
                 break
             if not is_dup:
@@ -904,6 +937,52 @@ while True:
         cv2.putText(frame, plabel, (x1 + 3, y1 - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
 
+    # ── POSE PASS (sleeping detection) ────────────────────────────────────────
+    run_pose_pass = (pose_model is not None) and confirmed_boxes \
+        and (frame_count % POSE_CHECK_EVERY_N_FRAMES == 0)
+
+    if run_pose_pass:
+        crop_imgs, crop_meta = [], []
+        for cid, box in confirmed_boxes.items():
+            ex1, ey1, ex2, ey2 = expand_box(box, ROI_PADDING_RATIO, frame_width, frame_height)
+            crop = frame[ey1:ey2, ex1:ex2]
+            if crop.size == 0:
+                continue
+            crop_imgs.append(crop)
+            crop_meta.append((cid, box))
+
+        if crop_imgs:
+            pose_results = pose_model.predict(
+                crop_imgs, conf=POSE_CONF, imgsz=POSE_CROP_IMGSZ,
+                device=DEVICE, half=HALF, verbose=False
+            )
+            for (cid, obox), res in zip(crop_meta, pose_results):
+                _pose_stats['checked_boxes'] += 1
+                kp_xy, kp_conf = _pick_dominant_pose(res)
+                if kp_xy is None:
+                    _pose_stats['no_pose_found'] += 1
+                    continue
+                label, pconf = classify_sleep_pose(kp_xy, kp_conf)
+                if label is None:
+                    _pose_stats['low_conf_skipped'] += 1
+                    continue
+                _pose_stats['sleeping' if label == 'SLEEPING' else 'awake'] += 1
+
+                x1, y1, x2, y2 = obox
+                cursor.execute("""
+                    INSERT INTO events
+                        (timestamp, person_id, event_type, confidence,
+                         bbox_x1, bbox_y1, bbox_x2, bbox_y2, vlm_summary)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (round(current_ts, 3), cid, "pose_detected", round(float(pconf), 4),
+                      x1, y1, x2, y2, label))
+
+                if label == "SLEEPING":
+                    print(f"  [POSE] Person {cid} classified SLEEPING "
+                          f"(confidence={pconf:.2f}) at t={current_ts:.1f}s")
+                    cv2.putText(frame, "SLEEPING?", (x1, y2 + 18),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+
     run_face_pass = (face_model is not None) and (frame_count % FACE_DETECT_EVERY_N_FRAMES == 0)
 
     if run_face_pass:
@@ -1027,6 +1106,11 @@ while True:
               f"low_conf={_face_check_stats['low_conf']} checked={_face_check_stats['checked']} "
               f"own_mismatch={_face_check_stats['own_mismatch']} "
               f"gallery_sizes={ {cid: len(g) for cid, g in last_known_face_gallery.items()} }")
+        print(f"    [POSE STATS since start] checked_boxes={_pose_stats['checked_boxes']} "
+              f"no_pose_found={_pose_stats['no_pose_found']} "
+              f"multi_pose_in_crop={_pose_stats['multi_pose_in_crop']} "
+              f"low_conf_skipped={_pose_stats['low_conf_skipped']} "
+              f"sleeping={_pose_stats['sleeping']} awake={_pose_stats['awake']}")
 
     print(f"PROGRESS:{frame_count}:{total_frames}", flush=True)
 

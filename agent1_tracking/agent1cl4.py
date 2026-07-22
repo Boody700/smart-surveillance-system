@@ -1,20 +1,32 @@
 # agent1_tracking/agent1.py
 # Agent 1: Full production pipeline — SPLIT DETECTION + FACE DETECTION
 #
-# THREE separate inference passes per frame:
-#   1. PERSON pass   — class 0 only, higher conf, full tracking
-#   2. PHONE  pass   — class 67 only, lower conf, dedicated focus
-#   3. FACE   pass   — face_detection_model.pt, no tracking, just detection + crop
-#
-# Position-based Re-ID is preserved from the original.
-# Face detections are linked to the nearest confirmed person by bbox overlap.
+# ── WHAT CHANGED IN THIS VERSION ──────────────────────────────────────────────
+# FACE-GALLERY RE-ENTRY MATCH, HARDENED (this version): the previous version
+# of this check made a single-frame, one-shot, PERMANENT identity decision —
+# one bad-angle or ambiguous face read could commit someone to the wrong
+# identity forever, with no way to reconsider. Two fixes, matching how any
+# real biometric verification system avoids exactly this:
+#   1. MULTI-SAMPLE AGGREGATION: face embeddings are now collected across the
+#      WHOLE probation window for a raw track (every frame, not just the
+#      graduation moment), then averaged into one candidate embedding before
+#      ever being compared to a gallery. A single noisy frame can no longer
+#      decide anyone's identity by itself.
+#   2. MARGIN REQUIREMENT: matching the top gallery candidate is no longer
+#      enough on its own — the top candidate must beat the SECOND-best
+#      candidate by a clear margin (FACE_REENTRY_MATCH_MARGIN). A close call
+#      between two plausible people is exactly the case that used to produce
+#      silent wrong-identity assignments; now it falls back to the safer
+#      body-based matching instead of guessing.
 
 import os
 import sys
 import cv2
+import json
 import sqlite3
 import numpy as np
 from ultralytics import YOLO
+import torch
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT_DIR)
@@ -22,13 +34,43 @@ sys.path.append(ROOT_DIR)
 from config import VIDEO_PATH as DEFAULT_VIDEO_PATH, MODEL_NAME, DATABASE_PATH
 
 FACE_MODEL_PATH  = os.path.join(ROOT_DIR, "face_detection_model.pt")
-PHONE_MODEL_PATH = os.path.join(ROOT_DIR, "Phone_best.pt")
+PHONE_MODEL_PATH = os.path.join(ROOT_DIR, "best_phone.pt")
 
-# Video path can be overridden from the command line (e.g. by app.py passing
-# the uploaded file's path). Falls back to config.py's default otherwise.
+# ── DEVICE SETUP ───────────────────────────────────────────────────────────────
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+HALF   = DEVICE.startswith("cuda")
+if DEVICE.startswith("cuda"):
+    torch.backends.cudnn.benchmark = True
+    gpu_name = torch.cuda.get_device_name(0)
+    print(f"[INFO] GPU detected: {gpu_name} — running on {DEVICE} (FP16={HALF})")
+else:
+    print("[WARN] No GPU detected — running on CPU. This will be significantly "
+          "slower than real-time; consider running on the GPU machine.")
+
+# ── ZONE DATA ──────────────────────────────────────────────────────────────────
+ZONES_JSON_PATH = os.path.join(os.path.dirname(DATABASE_PATH), "zones.json")
+
+def _load_zones_norm():
+    if not os.path.exists(ZONES_JSON_PATH):
+        return []
+    try:
+        with open(ZONES_JSON_PATH) as f:
+            return json.load(f).get("zones", [])
+    except Exception:
+        return []
+
+_ZONES_NORM = _load_zones_norm()
+
+def _zone_for_point(cx, cy, zones_norm, fw, fh):
+    for zi, zone in enumerate(zones_norm):
+        poly = np.array([[p[0] * fw, p[1] * fh] for p in zone], dtype=np.float32)
+        if cv2.pointPolygonTest(poly, (float(cx), float(cy)), False) >= 0:
+            return zi
+    return None
+
 VIDEO_PATH = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_VIDEO_PATH
 
-print("\n=== AGENT 1 STARTING: SPLIT DETECTION + FACE ===")
+print("\n=== AGENT 1 STARTING: SPLIT DETECTION + FACE (DEEP RE-ID + HARDENED FACE-GALLERY RE-ENTRY) ===")
 print(f"[INFO] Video source: {VIDEO_PATH}"
       f"{'  (overridden via argv)' if len(sys.argv) > 1 else '  (from config.py default)'}")
 
@@ -38,6 +80,7 @@ cursor = conn.cursor()
 
 cursor.execute("DELETE FROM events")
 cursor.execute("DELETE FROM sqlite_sequence WHERE name='events'")
+cursor.execute("DROP TABLE IF EXISTS identity_merges")
 conn.commit()
 print(f"[INFO] Database: {DATABASE_PATH}  — cleared, starting fresh.")
 
@@ -55,24 +98,29 @@ frame_height = int(video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
 print(f"[INFO] Video: {total_frames} frames @ {fps:.2f} FPS  "
       f"({frame_width}x{frame_height})")
 
+_ZONES_PX = [
+    [(int(p[0] * frame_width), int(p[1] * frame_height)) for p in zone]
+    for zone in _ZONES_NORM
+]
+if _ZONES_PX:
+    print(f"[INFO] {len(_ZONES_PX)} calibrated zone(s) loaded — will be drawn on every frame.")
+else:
+    print("[INFO] No zones.json found (or it's empty) — no zone overlay will be drawn.")
+
 # ── OUTPUT VIDEO ──────────────────────────────────────────────────────────────
 output_dir  = os.path.join(ROOT_DIR, "output_videos")
 os.makedirs(output_dir, exist_ok=True)
-output_path = os.path.join(output_dir, "agent1_output.mp4")
+output_path = os.path.join(output_dir, "agent1_output8.mp4")
 fourcc      = cv2.VideoWriter_fourcc(*'mp4v')
 video_writer = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
-# ── LIVE PREVIEW FOR THE UI ───────────────────────────────────────────────────
-# Same contract as before: Streamlit polls this JPEG + reads PROGRESS lines
-# from stdout to drive a progress bar and a live "as it processes" preview.
 LIVE_FRAME_PATH  = os.path.join(ROOT_DIR, "live_frame.jpg")
-LIVE_FRAME_EVERY = 3  # write a preview frame every N frames
+LIVE_FRAME_EVERY = 3
 
-# ── FACE CROPS DIR ────────────────────────────────────────────────────────────
 face_crops_dir = os.path.join(ROOT_DIR, "face_crops")
 os.makedirs(face_crops_dir, exist_ok=True)
 
-# ── LOAD MODELS ───────────────────────────────────────────────────────────────
+# ── LOAD DETECTION MODELS ──────────────────────────────────────────────────────
 print(f"[INFO] Loading person model        : {MODEL_NAME}")
 model_main = YOLO(MODEL_NAME)
 
@@ -90,22 +138,221 @@ if os.path.exists(PHONE_MODEL_PATH):
 else:
     print(f"[WARN] Phone model NOT found at {PHONE_MODEL_PATH} — falling back to COCO class 67 on main model.")
 
+# ── DEEP APPEARANCE EMBEDDING MODEL ────────────────────────────────────────────
+EMBEDDING_REID_ENABLED = True
+EMBED_MODEL      = None
+EMBED_TRANSFORM  = None
+
+if EMBEDDING_REID_ENABLED:
+    try:
+        import torchvision.models as tvm
+        from torchvision.models import ResNet18_Weights
+        import torchvision.transforms as T
+
+        _backbone = tvm.resnet18(weights=ResNet18_Weights.DEFAULT)
+        _backbone.fc = torch.nn.Identity()
+        _backbone.eval().to(DEVICE)
+        if HALF:
+            _backbone.half()
+        EMBED_MODEL = _backbone
+
+        EMBED_TRANSFORM = T.Compose([
+            T.ToPILImage(),
+            T.Resize((256, 128)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        print("[INFO] Deep appearance embedding model (ResNet18) loaded — this is now "
+              "the primary Re-ID signal.")
+    except Exception as e:
+        print(f"[WARN] Could not load embedding model ({e}). "
+              f"Falling back to HSV histogram appearance matching only.")
+        EMBEDDING_REID_ENABLED = False
+
+def compute_embedding(frame, box):
+    if not EMBEDDING_REID_ENABLED or EMBED_MODEL is None:
+        return None
+    x1, y1, x2, y2 = box
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(frame_width - 1, x2), min(frame_height - 1, y2)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    h = y2 - y1
+    ty1, ty2 = y1 + int(h * 0.25), y1 + int(h * 0.85)
+    if ty2 <= ty1:
+        ty1, ty2 = y1, y2
+    crop = frame[ty1:ty2, x1:x2]
+    if crop.size == 0:
+        return None
+    rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    tensor = EMBED_TRANSFORM(rgb).unsqueeze(0).to(DEVICE)
+    if HALF:
+        tensor = tensor.half()
+    with torch.no_grad():
+        feat = EMBED_MODEL(tensor)
+        feat = torch.nn.functional.normalize(feat, dim=1)
+    return feat.squeeze(0).float().cpu().numpy()
+
+def compute_face_embedding(frame, box):
+    if not EMBEDDING_REID_ENABLED or EMBED_MODEL is None:
+        return None
+    x1, y1, x2, y2 = box
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(frame_width - 1, x2), min(frame_height - 1, y2)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    crop = frame[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None
+    rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    tensor = EMBED_TRANSFORM(rgb).unsqueeze(0).to(DEVICE)
+    if HALF:
+        tensor = tensor.half()
+    with torch.no_grad():
+        feat = EMBED_MODEL(tensor)
+        feat = torch.nn.functional.normalize(feat, dim=1)
+    return feat.squeeze(0).float().cpu().numpy()
+
+def cosine_sim(a, b):
+    if a is None or b is None:
+        return -1.0
+    return float(np.dot(a, b))
+
+def compute_appearance_hist(frame, box):
+    x1, y1, x2, y2 = box
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(frame_width - 1, x2), min(frame_height - 1, y2)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    h = y2 - y1
+    ty1, ty2 = y1 + int(h * 0.25), y1 + int(h * 0.85)
+    crop = frame[ty1:ty2, x1:x2]
+    if crop.size == 0:
+        return None
+    hsv  = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [32, 32], [0, 180, 0, 256])
+    cv2.normalize(hist, hist)
+    return hist
+
 # ── TRACKING STATE ────────────────────────────────────────────────────────────
-raw_id_counters  = {}   # raw_id  -> frame count survived
-id_registry      = {}   # raw_id  -> clean sequential ID
+raw_id_counters  = {}
+id_registry      = {}
 next_clean_id    = 1
 
-last_seen_frame  = {}   # raw_id  -> last frame it appeared
-position_history = {}   # raw_id  -> [(cx,cy), ...] during probation
-last_known_pos   = {}   # clean_id -> (cx, cy)  — used for Re-ID + face linking
+last_seen_frame  = {}
+position_history = {}
+last_known_pos   = {}
+last_known_emb   = {}
+last_known_hist  = {}
+
+id_emb_sum    = {}
+id_emb_count  = {}
+id_hist_sum   = {}
+id_hist_count = {}
+id_frame_set  = {}
+id_zone_votes = {}
+id_first_seen = {}
+
+HOME_ZONE_WARMUP_SECONDS = 20
+HOME_ZONE_WARMUP_FRAMES  = int(fps * HOME_ZONE_WARMUP_SECONDS) if fps else 600
 
 GRACE_PERIOD_FRAMES   = 45
-MIN_FRAMES_TO_CONFIRM = 50
-REID_DISTANCE_THRESH  = 250   # px — raise if Re-ID misses, lower if it merges people
+MIN_FRAMES_TO_CONFIRM = 10
+REID_DISTANCE_THRESH  = 250
 
-# Per-person face crop — save one good crop per person (highest conf face seen)
-best_face_conf  = {}    # clean_id -> best conf seen so far
-best_face_crop  = {}    # clean_id -> path to saved crop
+MOTION_VALIDITY_ENABLED   = True
+MIN_MOVEMENT_SPREAD       = 3
+MOTION_CHECK_GRACE_FRAMES = 150
+MOTION_CHECK_HARD_CAP     = 450
+STATIC_OBJECT_MIN_AVG_CONF = 0.55
+rejected_raw_ids = set()
+raw_conf_history  = {}
+
+# NEW: face embeddings collected across a raw track's WHOLE probation window,
+# not just a single frame at graduation — see module docstring.
+raw_face_emb_history = {}   # raw_id -> [face embeddings...]
+
+DEDUP_CENTER_DIST_THRESH = 40
+DEDUP_SIZE_RATIO_THRESH  = 0.35
+
+PERSISTENT_DUPLICATE_FRAMES_THRESHOLD = 15
+_dup_pair_counts = {}
+
+EMBEDDING_MATCH_FLOOR = 0.72
+APPEARANCE_SEARCH_RADIUS = 650
+APPEARANCE_MATCH_FLOOR   = 0.55
+
+ONLINE_ZONE_BOOST_ENABLED   = True
+ZONE_ONLINE_EMBEDDING_FLOOR = 0.55
+ZONE_ONLINE_MIN_VOTES       = 30
+
+# ── FACE-ANCHORED SWAP CORRECTION ─────────────────────────────────────────────
+FACE_SWAP_CHECK_ENABLED       = True
+FACE_EMB_MIN_CONF_FOR_CHECK   = 0.65
+FACE_EMB_OWN_MATCH_FLOOR      = 0.45
+FACE_EMB_SWAP_CONFIRM_FLOOR   = 0.55
+SWAP_COOLDOWN_FRAMES          = 90
+
+FACE_SWAP_PERSISTENCE_THRESHOLD = 4
+_face_swap_evidence = {}
+
+FACE_GALLERY_MAX_SIZE          = 5
+FACE_GALLERY_DIVERSITY_MAX_SIM = 0.85
+last_known_face_gallery = {}
+
+# ── FACE-GALLERY RE-ENTRY MATCH (hardened) ────────────────────────────────────
+FACE_REENTRY_CHECK_ENABLED = True
+FACE_REENTRY_MATCH_FLOOR   = 0.45   # absolute floor the TOP candidate must clear
+FACE_REENTRY_MATCH_MARGIN  = 0.10   # AND must beat the 2nd-best candidate by
+                                      # at least this much — a close top-2 call
+                                      # is exactly the ambiguous case that used
+                                      # to silently pick the wrong person
+FACE_REENTRY_MIN_SAMPLES   = 2      # need at least this many face reads
+                                      # (aggregated across probation, not one
+                                      # frame) before trusting the average at all
+
+def _face_gallery_best_sim(cid, face_emb):
+    gallery = last_known_face_gallery.get(cid)
+    if not gallery:
+        return None
+    return max(cosine_sim(face_emb, g) for g in gallery)
+
+def _face_gallery_add(cid, face_emb):
+    gallery = last_known_face_gallery.setdefault(cid, [])
+    if len(gallery) >= FACE_GALLERY_MAX_SIZE:
+        return
+    if gallery and max(cosine_sim(face_emb, g) for g in gallery) >= FACE_GALLERY_DIVERSITY_MAX_SIM:
+        return
+    gallery.append(face_emb)
+
+_swap_cooldown = {}
+_face_check_stats = {'unlinked': 0, 'low_conf': 0, 'checked': 0, 'own_mismatch': 0}
+
+# ── DETECTION THRESHOLDS ───────────────────────────────────────────────────────
+PERSON_CONF = 0.20
+PERSON_IOU  = 0.30
+
+PHONE_CONF  = 0.60
+PHONE_IOU   = 0.30
+PHONE_COCO_FALLBACK_CONF = 0.40
+PHONE_COCO_FALLBACK_IOU  = 0.30
+
+FACE_CONF   = 0.60
+FACE_IOU    = 0.40
+
+MERGE_EMBEDDING_THRESHOLD      = 0.62
+ZONE_MERGE_EMBEDDING_THRESHOLD = 0.42
+MERGE_APPEARANCE_THRESHOLD      = 0.65
+ZONE_MERGE_APPEARANCE_THRESHOLD = 0.40
+
+ROI_PADDING_RATIO           = 0.15
+PHONE_CROP_IMGSZ            = 640
+FACE_CROP_IMGSZ             = 320
+FACE_DETECT_EVERY_N_FRAMES  = 1
+FACE_HEAD_REGION_FRACTION   = 0.55
+
+best_face_conf = {}
+best_face_crop = {}
 
 frame_count = 0
 
@@ -114,54 +361,206 @@ def get_center(box):
     x1, y1, x2, y2 = box
     return ((x1 + x2) // 2, (y1 + y2) // 2)
 
-def find_matching_clean_id(avg_cx, avg_cy):
-    best_cid  = None
-    best_dist = float("inf")
+def expand_box(box, pad_ratio, fw, fh):
+    x1, y1, x2, y2 = box
+    w, h = x2 - x1, y2 - y1
+    px, py = int(w * pad_ratio), int(h * pad_ratio)
+    return (max(0, x1 - px), max(0, y1 - py), min(fw - 1, x2 + px), min(fh - 1, y2 + py))
+
+def _boxes_are_duplicate(boxA, boxB,
+                          center_thresh=DEDUP_CENTER_DIST_THRESH,
+                          size_ratio_thresh=DEDUP_SIZE_RATIO_THRESH):
+    axc, ayc = get_center(boxA)
+    bxc, byc = get_center(boxB)
+    if np.sqrt((axc - bxc) ** 2 + (ayc - byc) ** 2) > center_thresh:
+        return False
+    aw, ah = boxA[2] - boxA[0], boxA[3] - boxA[1]
+    bw, bh = boxB[2] - boxB[0], boxB[3] - boxB[1]
+    if aw <= 0 or ah <= 0 or bw <= 0 or bh <= 0:
+        return False
+    w_ratio = abs(aw - bw) / max(aw, bw)
+    h_ratio = abs(ah - bh) / max(ah, bh)
+    return w_ratio <= size_ratio_thresh and h_ratio <= size_ratio_thresh
+
+def _current_home_zone(cid, min_votes=ZONE_ONLINE_MIN_VOTES):
+    votes = id_zone_votes.get(cid)
+    if not votes:
+        return None
+    zone, count = max(votes.items(), key=lambda kv: kv[1])
+    return zone if count >= min_votes else None
+
+def _quick_face_embedding_for_box(frame, box):
+    """Crops a padded region around a person box, runs a quick face
+    detection on JUST that crop, and returns the embedding of the best face
+    found (or None). Used both during probation (to build up
+    raw_face_emb_history) and as a last-chance fresh read at graduation."""
+    if face_model is None:
+        return None
+    ex1, ey1, ex2, ey2 = expand_box(box, 0.15, frame_width, frame_height)
+    crop = frame[ey1:ey2, ex1:ex2]
+    if crop.size == 0:
+        return None
+    try:
+        res = face_model.predict(crop, conf=FACE_CONF, iou=FACE_IOU, imgsz=FACE_CROP_IMGSZ,
+                                  device=DEVICE, half=HALF, verbose=False)
+    except Exception:
+        return None
+    r0 = res[0]
+    if r0.boxes is None or len(r0.boxes) == 0:
+        return None
+    fboxes = r0.boxes.xyxy.int().tolist()
+    fconfs = r0.boxes.conf.tolist()
+    best_i = max(range(len(fconfs)), key=lambda i: fconfs[i])
+    fx1, fy1, fx2, fy2 = fboxes[best_i]
+    face_box_full = (fx1 + ex1, fy1 + ey1, fx2 + ex1, fy2 + ey1)
+    return compute_face_embedding(frame, face_box_full)
+
+def find_face_match_for_reentry(raw_id, frame, box, exclude_cids=None):
+    """
+    Checked FIRST at graduation time, before body embedding/HSV/position.
+
+    HARDENED vs the previous version: uses EVERY face embedding collected
+    for this raw_id across its whole probation window (raw_face_emb_history),
+    averaged into one candidate embedding — not a single frame's read. Also
+    requires the top gallery candidate to beat the SECOND-best candidate by
+    a clear margin (FACE_REENTRY_MATCH_MARGIN), not just clear an absolute
+    floor. A close top-2 call falls back to body-based matching instead of
+    guessing — that ambiguous-margin case is exactly what silently produced
+    a wrong-identity assignment before.
+
+    Returns the matching clean_id, or None (caller falls back to body-based
+    matching as before).
+    """
+    if not FACE_REENTRY_CHECK_ENABLED or face_model is None or not last_known_face_gallery:
+        return None
+
+    exclude_cids = exclude_cids or set()
+    samples = list(raw_face_emb_history.get(raw_id, []))
+
+    # One more fresh read on the current (graduation-moment) box, in case
+    # the probation window itself never caught a usable face.
+    fresh = _quick_face_embedding_for_box(frame, box)
+    if fresh is not None:
+        samples.append(fresh)
+
+    if len(samples) < FACE_REENTRY_MIN_SAMPLES:
+        return None
+
+    avg = np.mean(samples, axis=0)
+    norm = np.linalg.norm(avg)
+    if norm == 0:
+        return None
+    cand_emb = avg / norm
+
+    scores = []
+    for cid in last_known_face_gallery:
+        if cid in exclude_cids:
+            continue
+        s = _face_gallery_best_sim(cid, cand_emb)
+        if s is not None:
+            scores.append((s, cid))
+
+    if not scores:
+        return None
+    scores.sort(reverse=True)
+    best_score, best_cid = scores[0]
+    second_score = scores[1][0] if len(scores) > 1 else -1.0
+    margin = best_score - second_score
+
+    if best_score >= FACE_REENTRY_MATCH_FLOOR and margin >= FACE_REENTRY_MATCH_MARGIN:
+        print(f"  [FACE RE-ID] Matched via {len(samples)}-sample averaged face gallery "
+              f"(similarity={best_score:.2f}, margin over 2nd-best={margin:.2f}) — "
+              f"checked before body appearance since face identity is far more stable "
+              f"across a long absence than a generic body embedding.")
+        return best_cid
+
+    if best_score >= FACE_REENTRY_MATCH_FLOOR:
+        print(f"  [FACE RE-ID SKIPPED] Top candidate Person {best_cid} scored "
+              f"{best_score:.2f} ({len(samples)} samples) but only beat the 2nd-best "
+              f"by {margin:.2f} (need >= {FACE_REENTRY_MATCH_MARGIN}) — too ambiguous "
+              f"to trust, falling back to body-based matching instead of guessing.")
+
+    return None
+
+def find_matching_clean_id(avg_cx, avg_cy, frame, box, exclude_cids=None):
+    exclude_cids = exclude_cids or set()
+
+    best_cid, best_dist = None, float("inf")
     for cid, (lx, ly) in last_known_pos.items():
+        if cid in exclude_cids:
+            continue
         dist = np.sqrt((avg_cx - lx) ** 2 + (avg_cy - ly) ** 2)
         if dist < best_dist:
-            best_dist = dist
-            best_cid  = cid
-    return best_cid if best_dist <= REID_DISTANCE_THRESH else None
+            best_dist, best_cid = dist, cid
+    if best_cid is not None and best_dist <= REID_DISTANCE_THRESH:
+        return best_cid
 
-def iou(boxA, boxB):
-    """Intersection over union — used to match face bbox to person bbox."""
-    ax1, ay1, ax2, ay2 = boxA
-    bx1, by1, bx2, by2 = boxB
-    ix1 = max(ax1, bx1); iy1 = max(ay1, by1)
-    ix2 = min(ax2, bx2); iy2 = min(ay2, by2)
-    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-    if inter == 0:
-        return 0.0
-    areaA = (ax2 - ax1) * (ay2 - ay1)
-    areaB = (bx2 - bx1) * (by2 - by1)
-    return inter / float(areaA + areaB - inter)
+    cand_emb = compute_embedding(frame, box) if EMBEDDING_REID_ENABLED else None
+
+    if ONLINE_ZONE_BOOST_ENABLED and cand_emb is not None:
+        cur_zone = _zone_for_point(avg_cx, avg_cy, _ZONES_NORM, frame_width, frame_height)
+        if cur_zone is not None:
+            best_zone_cid, best_zone_score = None, -1.0
+            for cid, emb in last_known_emb.items():
+                if cid in exclude_cids:
+                    continue
+                if _current_home_zone(cid) != cur_zone:
+                    continue
+                score = cosine_sim(cand_emb, emb)
+                if score >= ZONE_ONLINE_EMBEDDING_FLOOR and score > best_zone_score:
+                    best_zone_score, best_zone_cid = score, cid
+            if best_zone_cid is not None:
+                print(f"  [ZONE+EMBEDDING RE-ID] Matched via home-zone + appearance "
+                      f"(similarity={best_zone_score:.2f}, zone={cur_zone})")
+                return best_zone_cid
+
+    if cand_emb is not None:
+        best_emb_cid, best_emb_score = None, -1.0
+        for cid, emb in last_known_emb.items():
+            if cid in exclude_cids:
+                continue
+            score = cosine_sim(cand_emb, emb)
+            if score >= EMBEDDING_MATCH_FLOOR and score > best_emb_score:
+                best_emb_score, best_emb_cid = score, cid
+        if best_emb_cid is not None:
+            print(f"  [EMBEDDING RE-ID] Matched via deep appearance "
+                  f"(similarity={best_emb_score:.2f})")
+            return best_emb_cid
+
+    cand_hist = compute_appearance_hist(frame, box)
+    if cand_hist is not None:
+        best_h_cid, best_h_score = None, -1.0
+        for cid, (lx, ly) in last_known_pos.items():
+            if cid in exclude_cids:
+                continue
+            dist = np.sqrt((avg_cx - lx) ** 2 + (avg_cy - ly) ** 2)
+            if dist > APPEARANCE_SEARCH_RADIUS:
+                continue
+            hist = last_known_hist.get(cid)
+            if hist is None:
+                continue
+            score = cv2.compareHist(cand_hist, hist, cv2.HISTCMP_CORREL)
+            if score >= APPEARANCE_MATCH_FLOOR and score > best_h_score:
+                best_h_score, best_h_cid = score, cid
+        if best_h_cid is not None:
+            print(f"  [HSV RE-ID] Matched via clothing histogram fallback "
+                  f"(correlation={best_h_score:.2f})")
+            return best_h_cid
+
+    return None
 
 def face_inside_person(face_box, person_boxes_map):
-    """
-    Given a face bbox, find which confirmed person it belongs to.
-    Strategy: face centre must lie inside the person bbox,
-    OR fall back to closest person centre.
-    Returns clean_id or None.
-    """
     fx1, fy1, fx2, fy2 = face_box
     fcx, fcy = (fx1 + fx2) / 2, (fy1 + fy2) / 2
-
-    # Check containment first (face centre inside person box)
     for cid, (px1, py1, px2, py2) in person_boxes_map.items():
         if px1 <= fcx <= px2 and py1 <= fcy <= py2:
             return cid
-
-    # Fallback: closest person centre within 300px
-    best_cid  = None
-    best_dist = float("inf")
+    best_cid, best_dist = None, float("inf")
     for cid, (px1, py1, px2, py2) in person_boxes_map.items():
         pcx, pcy = (px1 + px2) / 2, (py1 + py2) / 2
         dist = np.sqrt((fcx - pcx) ** 2 + (fcy - pcy) ** 2)
         if dist < best_dist:
-            best_dist = dist
-            best_cid  = cid
-
+            best_dist, best_cid = dist, cid
     return best_cid if best_dist < 300 else None
 
 # ── MAIN LOOP ─────────────────────────────────────────────────────────────────
@@ -170,75 +569,253 @@ while True:
     if not success:
         break
 
-    frame_count    += 1
-    current_ts      = frame_count / fps
-    active_people   = set()
+    frame_count += 1
+    current_ts   = frame_count / fps
+    active_people = set()
 
-    # ── PASS 1: PERSON TRACKING ──────────────────────────────────────────────
     res_people = model_main.track(
         frame,
         persist=True,
         tracker="agent1_tracking/custom_tracker.yaml",
-        classes=[0],            # people only
-        conf=0.25,              # slightly higher — fewer false positives
-        iou=0.30,
-        imgsz=1280,             # bumped from 960 — people at desk-distance/partly
-                                 # occluded need the extra resolution; this pass
-                                 # doesn't do tracking-match dedup so the speed
-                                 # cost is worth it. Drop back to 960 if CPU-bound.
+        classes=[0],
+        conf=PERSON_CONF,
+        iou=PERSON_IOU,
+        imgsz=1280,
+        device=DEVICE,
+        half=HALF,
         verbose=False
     )
 
     person_frame    = res_people[0]
-    confirmed_boxes = {}    # clean_id -> (x1,y1,x2,y2) for face linking this frame
+    confirmed_boxes = {}
 
     if person_frame.boxes.id is not None:
         raw_ids     = person_frame.boxes.id.int().tolist()
         boxes       = person_frame.boxes.xyxy.int().tolist()
         confidences = person_frame.boxes.conf.tolist()
 
-        # PHASE 1a: probation + graduation
-        for raw_id, box in zip(raw_ids, boxes):
+        order = sorted(range(len(raw_ids)), key=lambda i: confidences[i], reverse=True)
+        kept_idx = []
+        for i in order:
+            is_dup = False
+            for j in kept_idx:
+                if not _boxes_are_duplicate(boxes[i], boxes[j]):
+                    continue
+
+                dup_raw_id, surv_raw_id = raw_ids[i], raw_ids[j]
+                dup_cid  = id_registry.get(dup_raw_id)
+                surv_cid = id_registry.get(surv_raw_id)
+
+                if dup_cid is not None and surv_cid is not None and dup_cid != surv_cid:
+                    pair_key = frozenset((dup_cid, surv_cid))
+                    _dup_pair_counts[pair_key] = _dup_pair_counts.get(pair_key, 0) + 1
+                    occurrences = _dup_pair_counts[pair_key]
+
+                    if occurrences < PERSISTENT_DUPLICATE_FRAMES_THRESHOLD:
+                        print(f"[WARN] raw_id={dup_raw_id} (Person {dup_cid}) and "
+                              f"raw_id={surv_raw_id} (Person {surv_cid}) produced "
+                              f"near-identical boxes this frame but are ALREADY "
+                              f"different confirmed people ({occurrences}/"
+                              f"{PERSISTENT_DUPLICATE_FRAMES_THRESHOLD} occurrences "
+                              f"so far) — leaving both identities untouched for now.")
+                        continue
+
+                    keep, drop = (dup_cid, surv_cid) if dup_cid < surv_cid else (surv_cid, dup_cid)
+                    print(f"[LIVE MERGE] Person {drop} and Person {keep} have produced "
+                          f"near-identical boxes in {occurrences} separate frames — "
+                          f"this is almost certainly ONE physical person double-tracked "
+                          f"as two IDs, not two people. Merging Person {drop} into "
+                          f"Person {keep} now, retroactively fixing already-logged DB rows.")
+
+                    cursor.execute("UPDATE events SET person_id = ? WHERE person_id = ?", (keep, drop))
+                    conn.commit()
+
+                    for rid, cid in list(id_registry.items()):
+                        if cid == drop:
+                            id_registry[rid] = keep
+
+                    if drop in last_known_pos:
+                        last_known_pos[keep] = last_known_pos.pop(drop)
+                    if drop in last_known_emb and keep not in last_known_emb:
+                        last_known_emb[keep] = last_known_emb.pop(drop)
+                    else:
+                        last_known_emb.pop(drop, None)
+                    if drop in last_known_hist and keep not in last_known_hist:
+                        last_known_hist[keep] = last_known_hist.pop(drop)
+                    else:
+                        last_known_hist.pop(drop, None)
+                    if drop in last_known_face_gallery:
+                        keep_gallery = last_known_face_gallery.setdefault(keep, [])
+                        for g in last_known_face_gallery.pop(drop):
+                            if len(keep_gallery) >= FACE_GALLERY_MAX_SIZE:
+                                break
+                            if not keep_gallery or max(cosine_sim(g, k) for k in keep_gallery) < FACE_GALLERY_DIVERSITY_MAX_SIM:
+                                keep_gallery.append(g)
+
+                    if drop in id_emb_sum:
+                        id_emb_sum[keep] = id_emb_sum.get(keep, 0) + id_emb_sum.pop(drop)
+                        id_emb_count[keep] = id_emb_count.get(keep, 0) + id_emb_count.pop(drop, 0)
+                    if drop in id_hist_sum:
+                        id_hist_sum[keep] = id_hist_sum.get(keep, 0) + id_hist_sum.pop(drop)
+                        id_hist_count[keep] = id_hist_count.get(keep, 0) + id_hist_count.pop(drop, 0)
+                    if drop in id_frame_set:
+                        id_frame_set.setdefault(keep, set()).update(id_frame_set.pop(drop))
+                    if drop in id_zone_votes:
+                        keep_votes = id_zone_votes.setdefault(keep, {})
+                        for z, c in id_zone_votes.pop(drop).items():
+                            keep_votes[z] = keep_votes.get(z, 0) + c
+                    if drop in id_first_seen:
+                        keep_first = id_first_seen.get(keep, id_first_seen[drop])
+                        id_first_seen[keep] = min(keep_first, id_first_seen.pop(drop))
+                    best_face_conf.pop(drop, None)
+                    best_face_crop.pop(drop, None)
+                    _dup_pair_counts.pop(pair_key, None)
+
+                    last_seen_frame[dup_raw_id] = frame_count
+                    is_dup = True
+                    break
+
+                last_seen_frame[dup_raw_id] = frame_count
+                if surv_cid is not None and dup_cid is None:
+                    id_registry[dup_raw_id] = surv_cid
+                    print(f"  [DEDUP] raw_id={dup_raw_id} overlaps confirmed "
+                          f"raw_id={surv_raw_id} (same person, same frame) — "
+                          f"aliased to Person {surv_cid} instead of "
+                          f"tracking as a separate identity.")
+                elif dup_cid is not None and surv_cid is None:
+                    id_registry[surv_raw_id] = dup_cid
+                    print(f"  [DEDUP] raw_id={surv_raw_id} overlaps confirmed "
+                          f"raw_id={dup_raw_id} (same person, same frame) — "
+                          f"aliased to Person {dup_cid} instead of "
+                          f"tracking as a separate identity.")
+                is_dup = True
+                break
+            if not is_dup:
+                kept_idx.append(i)
+        kept_idx = sorted(kept_idx)
+        raw_ids     = [raw_ids[i] for i in kept_idx]
+        boxes       = [boxes[i] for i in kept_idx]
+        confidences = [confidences[i] for i in kept_idx]
+
+        currently_active_cids = {
+            id_registry[rid] for rid in raw_ids if rid in id_registry
+        }
+
+        for raw_id, box, _conf_this_frame in zip(raw_ids, boxes, confidences):
             cx, cy = get_center(box)
 
             if raw_id in last_seen_frame and (frame_count - last_seen_frame[raw_id]) <= GRACE_PERIOD_FRAMES:
                 raw_id_counters[raw_id] = raw_id_counters.get(raw_id, 0) + 1
             else:
                 raw_id_counters[raw_id] = 1
-                position_history[raw_id] = []
+                position_history[raw_id]     = []
+                raw_conf_history[raw_id]     = []
+                raw_face_emb_history[raw_id] = []
 
             last_seen_frame[raw_id] = frame_count
 
             if raw_id not in id_registry:
                 position_history.setdefault(raw_id, []).append((cx, cy))
+                raw_conf_history.setdefault(raw_id, []).append(_conf_this_frame)
 
-            if raw_id_counters[raw_id] >= MIN_FRAMES_TO_CONFIRM and raw_id not in id_registry:
+                # Collect a face sample for THIS probation frame too, if one
+                # is findable — this is what lets graduation-time matching
+                # use an average of several reads instead of a single frame.
+                if FACE_REENTRY_CHECK_ENABLED and face_model is not None:
+                    fe = _quick_face_embedding_for_box(frame, box)
+                    if fe is not None:
+                        raw_face_emb_history.setdefault(raw_id, []).append(fe)
+
+            if raw_id_counters[raw_id] >= MIN_FRAMES_TO_CONFIRM \
+                    and raw_id not in id_registry and raw_id not in rejected_raw_ids:
                 positions = position_history.get(raw_id, [(cx, cy)])
-                avg_cx    = int(np.mean([p[0] for p in positions]))
-                avg_cy    = int(np.mean([p[1] for p in positions]))
-                matched   = find_matching_clean_id(avg_cx, avg_cy)
+                xs = [p[0] for p in positions]
+                ys = [p[1] for p in positions]
+                spread = (max(xs) - min(xs)) + (max(ys) - min(ys))
+
+                if MOTION_VALIDITY_ENABLED and spread < MIN_MOVEMENT_SPREAD:
+                    conf_hist = raw_conf_history.get(raw_id, [])
+                    avg_conf  = float(np.mean(conf_hist)) if conf_hist else 0.0
+
+                    if avg_conf >= STATIC_OBJECT_MIN_AVG_CONF:
+                        print(f"[CAUTION] raw_id={raw_id} graduating after "
+                              f"{raw_id_counters[raw_id]} frames with near-zero movement "
+                              f"(spread={spread}px) but high avg confidence "
+                              f"({avg_conf:.2f}) — treating as a real, still person.")
+                    elif raw_id_counters[raw_id] < MOTION_CHECK_HARD_CAP:
+                        continue
+                    else:
+                        rejected_raw_ids.add(raw_id)
+                        raw_face_emb_history.pop(raw_id, None)
+                        print(f"[REJECTED] raw_id={raw_id} discarded after "
+                              f"{raw_id_counters[raw_id]} frames — near-zero movement "
+                              f"(spread={spread}px) and low avg confidence "
+                              f"({avg_conf:.2f}). Likely a static object, not a person.")
+                        continue
+
+                avg_cx, avg_cy = int(np.mean(xs)), int(np.mean(ys))
+
+                matched = find_face_match_for_reentry(raw_id, frame, box, exclude_cids=currently_active_cids)
+                if matched is None:
+                    matched = find_matching_clean_id(
+                        avg_cx, avg_cy, frame, box, exclude_cids=currently_active_cids
+                    )
+
+                raw_face_emb_history.pop(raw_id, None)
+
                 if matched is not None:
                     id_registry[raw_id] = matched
+                    currently_active_cids.add(matched)
                     print(f"[RE-ENTRY] Person {matched} returned! (raw_id={raw_id})")
                 else:
                     id_registry[raw_id] = next_clean_id
+                    currently_active_cids.add(next_clean_id)
                     next_clean_id += 1
                     print(f"[NEW PERSON] Person ID {id_registry[raw_id]} confirmed.")
 
-        # PHASE 1b: update positions
         for raw_id, box in zip(raw_ids, boxes):
-            if raw_id in id_registry:
-                last_known_pos[id_registry[raw_id]] = get_center(box)
+            if raw_id not in id_registry:
+                continue
+            clean_id = id_registry[raw_id]
+            last_known_pos[clean_id] = get_center(box)
 
-        # PHASE 1c: write to DB + draw
+            emb = compute_embedding(frame, box)
+            if emb is not None:
+                last_known_emb[clean_id] = emb
+                if clean_id not in id_emb_sum:
+                    id_emb_sum[clean_id] = emb.copy()
+                else:
+                    id_emb_sum[clean_id] += emb
+                id_emb_count[clean_id] = id_emb_count.get(clean_id, 0) + 1
+
+            hist = compute_appearance_hist(frame, box)
+            if hist is not None:
+                last_known_hist[clean_id] = hist
+                if clean_id not in id_hist_sum:
+                    id_hist_sum[clean_id] = hist.copy()
+                else:
+                    id_hist_sum[clean_id] += hist
+                id_hist_count[clean_id] = id_hist_count.get(clean_id, 0) + 1
+
         for raw_id, box, conf in zip(raw_ids, boxes, confidences):
             if raw_id not in id_registry:
                 continue
-
             clean_id = id_registry[raw_id]
             active_people.add(clean_id)
             x1, y1, x2, y2 = box
             confirmed_boxes[clean_id] = (x1, y1, x2, y2)
+
+            id_frame_set.setdefault(clean_id, set()).add(frame_count)
+
+            if _ZONES_NORM:
+                if clean_id not in id_first_seen:
+                    id_first_seen[clean_id] = frame_count
+                if (frame_count - id_first_seen[clean_id]) <= HOME_ZONE_WARMUP_FRAMES:
+                    pcx, pcy = get_center(box)
+                    zone_idx = _zone_for_point(pcx, pcy, _ZONES_NORM, frame_width, frame_height)
+                    if zone_idx is not None:
+                        votes = id_zone_votes.setdefault(clean_id, {})
+                        votes[zone_idx] = votes.get(zone_idx, 0) + 1
 
             cursor.execute("""
                 INSERT INTO events
@@ -248,7 +825,6 @@ while True:
             """, (round(current_ts, 3), clean_id, "detected",
                   round(conf, 4), x1, y1, x2, y2))
 
-            # Draw person box
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
             label = f"ID:{clean_id}"
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
@@ -256,78 +832,73 @@ while True:
             cv2.putText(frame, label, (x1 + 3, y1 - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
 
-    # ── PASS 2: PHONE DETECTION ───────────────────────────────────────────────
-    # Uses your custom-trained single-class phone model if available,
-    # otherwise falls back to COCO class 67 on the main model.
-    if phone_model is not None:
-        res_phones = phone_model.predict(
-            frame,
-            conf=0.25,           # custom model — start moderate, tune after testing
-            iou=0.30,
-            imgsz=1280,           # phones are small objects — resolution is the
-                                  # single biggest lever here, worth the extra
-                                  # cost since this pass has no tracking overhead
-            verbose=False
-        )
-    else:
-        res_phones = model_main.predict(
-            frame,
-            classes=[67],
-            conf=0.12,
-            iou=0.30,
-            imgsz=1280,
-            verbose=False
-        )
+    phone_dets = []
 
-    phone_frame = res_phones[0]
+    if confirmed_boxes and (phone_model is not None or True):
+        crop_imgs, crop_meta = [], []
+        for cid, box in confirmed_boxes.items():
+            ex1, ey1, ex2, ey2 = expand_box(box, ROI_PADDING_RATIO, frame_width, frame_height)
+            crop = frame[ey1:ey2, ex1:ex2]
+            if crop.size == 0:
+                continue
+            crop_imgs.append(crop)
+            crop_meta.append((cid, ex1, ey1))
 
-    if phone_frame.boxes is not None and len(phone_frame.boxes):
-        ph_boxes = phone_frame.boxes.xyxy.int().tolist()
-        ph_confs = phone_frame.boxes.conf.tolist()
+        if crop_imgs:
+            if phone_model is not None:
+                results = phone_model.predict(
+                    crop_imgs, conf=PHONE_CONF, iou=PHONE_IOU, imgsz=PHONE_CROP_IMGSZ,
+                    device=DEVICE, half=HALF, verbose=False
+                )
+            else:
+                results = model_main.predict(
+                    crop_imgs, classes=[67], conf=PHONE_COCO_FALLBACK_CONF,
+                    iou=PHONE_COCO_FALLBACK_IOU,
+                    imgsz=PHONE_CROP_IMGSZ, device=DEVICE, half=HALF, verbose=False
+                )
+            for (cid, ox, oy), res in zip(crop_meta, results):
+                if res.boxes is None or len(res.boxes) == 0:
+                    continue
+                for pbox, pconf in zip(res.boxes.xyxy.int().tolist(), res.boxes.conf.tolist()):
+                    px1, py1, px2, py2 = pbox
+                    phone_dets.append((px1 + ox, py1 + oy, px2 + ox, py2 + oy, pconf, cid))
+    elif not confirmed_boxes:
+        if phone_model is not None:
+            res_full = phone_model.predict(frame, conf=PHONE_CONF, iou=PHONE_IOU, imgsz=1280,
+                                            device=DEVICE, half=HALF, verbose=False)
+        else:
+            res_full = model_main.predict(frame, classes=[67], conf=PHONE_COCO_FALLBACK_CONF,
+                                           iou=PHONE_COCO_FALLBACK_IOU,
+                                           imgsz=1280, device=DEVICE, half=HALF, verbose=False)
+        rf = res_full[0]
+        if rf.boxes is not None and len(rf.boxes):
+            for pbox, pconf in zip(rf.boxes.xyxy.int().tolist(), rf.boxes.conf.tolist()):
+                x1, y1, x2, y2 = pbox
+                phone_dets.append((x1, y1, x2, y2, pconf, None))
 
-        for box, conf in zip(ph_boxes, ph_confs):
-            x1, y1, x2, y2 = box
+    for x1, y1, x2, y2, conf, owner_id in phone_dets:
+        cursor.execute("""
+            INSERT INTO events
+                (timestamp, person_id, event_type, confidence,
+                 bbox_x1, bbox_y1, bbox_x2, bbox_y2)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (round(current_ts, 3), owner_id, "phone_detected",
+              round(conf, 4), x1, y1, x2, y2))
 
-            # Try to assign phone to nearest confirmed person
-            owner_id = None
-            if confirmed_boxes:
-                fcx, fcy = (x1 + x2) / 2, (y1 + y2) / 2
-                best_dist = float("inf")
-                for cid, (px1, py1, px2, py2) in confirmed_boxes.items():
-                    pcx, pcy = (px1 + px2) / 2, (py1 + py2) / 2
-                    dist = np.sqrt((fcx - pcx) ** 2 + (fcy - pcy) ** 2)
-                    if dist < best_dist:
-                        best_dist = dist
-                        owner_id  = cid
-                if best_dist > 400:   # too far — don't assign
-                    owner_id = None
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+        plabel = f"PHONE{f' P{owner_id}' if owner_id else ''} {conf:.2f}"
+        (tw, th), _ = cv2.getTextSize(plabel, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        cv2.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 6, y1), (0, 200, 200), -1)
+        cv2.putText(frame, plabel, (x1 + 3, y1 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
 
-            cursor.execute("""
-                INSERT INTO events
-                    (timestamp, person_id, event_type, confidence,
-                     bbox_x1, bbox_y1, bbox_x2, bbox_y2)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (round(current_ts, 3), owner_id, "phone_detected",
-                  round(conf, 4), x1, y1, x2, y2))
+    run_face_pass = (face_model is not None) and (frame_count % FACE_DETECT_EVERY_N_FRAMES == 0)
 
-            # Draw phone box
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
-            plabel = f"PHONE{f' P{owner_id}' if owner_id else ''} {conf:.2f}"
-            (tw, th), _ = cv2.getTextSize(plabel, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-            cv2.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 6, y1), (0, 200, 200), -1)
-            cv2.putText(frame, plabel, (x1 + 3, y1 - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
-
-    # ── PASS 3: FACE DETECTION ────────────────────────────────────────────────
-    if face_model is not None:
+    if run_face_pass:
         res_faces = face_model.predict(
-            frame,
-            conf=0.40,          # faces — keep reasonable threshold
-            iou=0.40,
-            imgsz=960,
-            verbose=False
+            frame, conf=FACE_CONF, iou=FACE_IOU, imgsz=960,
+            device=DEVICE, half=HALF, verbose=False
         )
-
         face_frame = res_faces[0]
 
         if face_frame.boxes is not None and len(face_frame.boxes):
@@ -336,79 +907,248 @@ while True:
 
             for fbox, fconf in zip(face_boxes, face_confs):
                 fx1, fy1, fx2, fy2 = fbox
-
-                # Clamp to frame bounds
                 fx1 = max(0, fx1); fy1 = max(0, fy1)
-                fx2 = min(frame_width - 1, fx2)
-                fy2 = min(frame_height - 1, fy2)
+                fx2 = min(frame_width - 1, fx2); fy2 = min(frame_height - 1, fy2)
 
-                # Link face to a confirmed person
-                owner_id = face_inside_person(fbox, confirmed_boxes)
+                cid = face_inside_person(fbox, confirmed_boxes)
 
-                # Save best face crop per person (highest conf wins)
+                if cid is None:
+                    _face_check_stats['unlinked'] += 1
+                elif fconf < FACE_EMB_MIN_CONF_FOR_CHECK:
+                    _face_check_stats['low_conf'] += 1
+
+                if FACE_SWAP_CHECK_ENABLED and cid is not None and fconf >= FACE_EMB_MIN_CONF_FOR_CHECK:
+                    _face_check_stats['checked'] += 1
+                    face_emb = compute_face_embedding(frame, (fx1, fy1, fx2, fy2))
+                    if face_emb is not None:
+                        own_sim = _face_gallery_best_sim(cid, face_emb)
+
+                        if own_sim is None or own_sim >= FACE_EMB_OWN_MATCH_FLOOR:
+                            _face_gallery_add(cid, face_emb)
+                        else:
+                            _face_check_stats['own_mismatch'] += 1
+                            best_other_cid, best_other_sim = None, -1.0
+                            for other_cid in confirmed_boxes.keys():
+                                if other_cid == cid:
+                                    continue
+                                s = _face_gallery_best_sim(other_cid, face_emb)
+                                if s is not None and s > best_other_sim:
+                                    best_other_sim, best_other_cid = s, other_cid
+
+                            if best_other_cid is not None and best_other_sim >= FACE_EMB_SWAP_CONFIRM_FLOOR \
+                                    and best_other_sim > own_sim:
+                                pair_key = frozenset((cid, best_other_cid))
+                                _face_swap_evidence[pair_key] = _face_swap_evidence.get(pair_key, 0) + 1
+                                evidence_count = _face_swap_evidence[pair_key]
+                                on_cooldown = frame_count - _swap_cooldown.get(pair_key, -10**9) < SWAP_COOLDOWN_FRAMES
+
+                                if evidence_count < FACE_SWAP_PERSISTENCE_THRESHOLD or on_cooldown:
+                                    status = "on cooldown" if on_cooldown else "not yet enough"
+                                    print(f"  [FACE MISMATCH] Person {cid}'s face matched Person "
+                                          f"{best_other_cid}'s gallery better than its own "
+                                          f"(own={own_sim:.2f}, other={best_other_sim:.2f}) — "
+                                          f"evidence {evidence_count}/{FACE_SWAP_PERSISTENCE_THRESHOLD} "
+                                          f"({status}, not correcting yet).")
+                                else:
+                                    raw_id_for_cid = next(
+                                        (rid for rid, c in id_registry.items() if c == cid and rid in raw_ids), None
+                                    )
+                                    raw_id_for_other = next(
+                                        (rid for rid, c in id_registry.items() if c == best_other_cid and rid in raw_ids), None
+                                    )
+                                    if raw_id_for_cid is not None and raw_id_for_other is not None:
+                                        id_registry[raw_id_for_cid]   = best_other_cid
+                                        id_registry[raw_id_for_other] = cid
+                                        last_known_face_gallery[cid], last_known_face_gallery[best_other_cid] = \
+                                            last_known_face_gallery.get(best_other_cid, []), last_known_face_gallery.get(cid, [])
+                                        _face_gallery_add(best_other_cid, face_emb)
+                                        _swap_cooldown[pair_key] = frame_count
+                                        _face_swap_evidence.pop(pair_key, None)
+                                        print(f"[SWAP CORRECTED] Face evidence shows Person {cid} and "
+                                              f"Person {best_other_cid} were swapped by the tracker "
+                                              f"(confirmed across {evidence_count} separate frames; "
+                                              f"own-gallery similarity={own_sim:.2f}, matched-other "
+                                              f"similarity={best_other_sim:.2f}) — corrected the raw-track "
+                                              f"mapping going forward.")
+                                        cid = best_other_cid
+
                 crop_path = None
-                if owner_id is not None:
-                    if fconf > best_face_conf.get(owner_id, 0.0):
-                        best_face_conf[owner_id] = fconf
-                        crop = frame[fy1:fy2, fx1:fx2]
-                        if crop.size > 0:
-                            crop_path = os.path.join(
-                                face_crops_dir,
-                                f"person_{owner_id}_face.jpg"
-                            )
-                            cv2.imwrite(crop_path, crop)
-                            best_face_crop[owner_id] = crop_path
+                if cid is not None and fconf > best_face_conf.get(cid, 0.0):
+                    best_face_conf[cid] = fconf
+                    face_crop = frame[fy1:fy2, fx1:fx2]
+                    if face_crop.size > 0:
+                        crop_path = os.path.join(face_crops_dir, f"person_{cid}_face.jpg")
+                        cv2.imwrite(crop_path, face_crop)
+                        best_face_crop[cid] = crop_path
 
-                # Log face detection
                 cursor.execute("""
                     INSERT INTO events
                         (timestamp, person_id, event_type, confidence,
                          bbox_x1, bbox_y1, bbox_x2, bbox_y2, crop_path)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (round(current_ts, 3), owner_id, "face_detected",
+                """, (round(current_ts, 3), cid, "face_detected",
                       round(fconf, 4), fx1, fy1, fx2, fy2, crop_path))
 
-                # Draw face box
                 cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (255, 100, 0), 2)
-                flabel = f"FACE{f' P{owner_id}' if owner_id else ''} {fconf:.2f}"
+                flabel = f"FACE{f' P{cid}' if cid is not None else ''} {fconf:.2f}"
                 (tw, th), _ = cv2.getTextSize(flabel, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
                 cv2.rectangle(frame, (fx1, fy1 - th - 8), (fx1 + tw + 6, fy1), (200, 80, 0), -1)
                 cv2.putText(frame, flabel, (fx1 + 3, fy1 - 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
-    # ── PROGRESS LOG ─────────────────────────────────────────────────────────
+    ZONE_COLOR_BGR = (241, 102, 99)
+    ZONE_LINE_THICKNESS = 1
+    for zi, zone_px in enumerate(_ZONES_PX):
+        pts = np.array(zone_px, dtype=np.int32)
+        cv2.polylines(frame, [pts], True, ZONE_COLOR_BGR, ZONE_LINE_THICKNESS, lineType=cv2.LINE_AA)
+        zx = int(np.mean(pts[:, 0])) - 30
+        zy = int(np.mean(pts[:, 1]))
+        cv2.putText(frame, f"Zone {zi}", (zx, zy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, ZONE_COLOR_BGR, 1, lineType=cv2.LINE_AA)
+
     if frame_count % 30 == 0:
         conn.commit()
         print(f" -> Frame {frame_count:>5}/{total_frames} | "
               f"Active people: {sorted(active_people)} | "
               f"Total confirmed: {sorted(set(id_registry.values()))}")
+        print(f"    [FACE CHECK STATS since start] unlinked={_face_check_stats['unlinked']} "
+              f"low_conf={_face_check_stats['low_conf']} checked={_face_check_stats['checked']} "
+              f"own_mismatch={_face_check_stats['own_mismatch']} "
+              f"gallery_sizes={ {cid: len(g) for cid, g in last_known_face_gallery.items()} }")
 
-    # Machine-readable progress line for the Streamlit UI (every frame, cheap)
     print(f"PROGRESS:{frame_count}:{total_frames}", flush=True)
 
-    # Live annotated-frame snapshot for the UI's "watch it process" preview
     if frame_count % LIVE_FRAME_EVERY == 0:
         cv2.imwrite(LIVE_FRAME_PATH, frame)
 
     video_writer.write(frame)
 
-# ── CLEANUP ───────────────────────────────────────────────────────────────────
+def _average_embedding(cid):
+    if id_emb_count.get(cid, 0) == 0:
+        return None
+    avg = id_emb_sum[cid] / id_emb_count[cid]
+    norm = np.linalg.norm(avg)
+    return avg / norm if norm > 0 else None
+
+def _average_hist(cid):
+    if id_hist_count.get(cid, 0) == 0:
+        return None
+    return id_hist_sum[cid] / id_hist_count[cid]
+
+def _home_zone(cid):
+    votes = id_zone_votes.get(cid)
+    if not votes:
+        return None
+    return max(votes, key=votes.get)
+
+def _appearance_score(id_a, id_b):
+    emb_a, emb_b = _average_embedding(id_a), _average_embedding(id_b)
+    if emb_a is not None and emb_b is not None:
+        return float(np.dot(emb_a, emb_b)), True
+
+    hist_a, hist_b = _average_hist(id_a), _average_hist(id_b)
+    if hist_a is not None and hist_b is not None:
+        score = cv2.compareHist(hist_a.astype(np.float32), hist_b.astype(np.float32),
+                                 cv2.HISTCMP_CORREL)
+        return float(score), False
+
+    return None, False
+
+all_confirmed_ids = sorted(set(id_registry.values()))
+parent = {cid: cid for cid in all_confirmed_ids}
+
+def _find_root(cid):
+    while parent[cid] != cid:
+        cid = parent[cid]
+    return cid
+
+merge_log = []
+for i, id_a in enumerate(all_confirmed_ids):
+    for id_b in all_confirmed_ids[i + 1:]:
+        if _find_root(id_a) == _find_root(id_b):
+            continue
+
+        if id_frame_set.get(id_a, set()) & id_frame_set.get(id_b, set()):
+            continue
+
+        score, used_embedding = _appearance_score(id_a, id_b)
+        if score is None:
+            continue
+
+        home_a, home_b = _home_zone(id_a), _home_zone(id_b)
+        same_zone = home_a is not None and home_a == home_b
+
+        if used_embedding:
+            threshold = ZONE_MERGE_EMBEDDING_THRESHOLD if same_zone else MERGE_EMBEDDING_THRESHOLD
+        else:
+            threshold = ZONE_MERGE_APPEARANCE_THRESHOLD if same_zone else MERGE_APPEARANCE_THRESHOLD
+
+        if score >= threshold:
+            root_a, root_b = _find_root(id_a), _find_root(id_b)
+            keep, drop = (root_a, root_b) if root_a < root_b else (root_b, root_a)
+            parent[drop] = keep
+            merge_log.append((drop, keep, score, used_embedding, same_zone,
+                               home_a if same_zone else None))
+
+if merge_log:
+    print("\n[IDENTITY RECONCILIATION] Merging fragmented tracks:")
+    for drop, keep, score, used_embedding, same_zone, zone_idx in merge_log:
+        sig = "embedding" if used_embedding else "HSV histogram"
+        zone_note = f", same home zone={zone_idx}" if same_zone else ""
+        print(f"  Person {drop} -> Person {keep}  "
+              f"({sig} similarity={score:.2f}, never co-present{zone_note})")
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS identity_merges (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            dropped_track_id     INTEGER,
+            canonical_person_id  INTEGER,
+            appearance_score     REAL,
+            used_embedding       INTEGER,
+            same_home_zone       INTEGER,
+            matching_zone_index  INTEGER,
+            merged_at_timestamp  TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    for drop, keep, score, used_embedding, same_zone, zone_idx in merge_log:
+        cursor.execute("""
+            INSERT INTO identity_merges
+                (dropped_track_id, canonical_person_id, appearance_score,
+                 used_embedding, same_home_zone, matching_zone_index)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (drop, keep, round(float(score), 4), int(used_embedding),
+              int(same_zone), zone_idx))
+
+    for cid in all_confirmed_ids:
+        root = _find_root(cid)
+        if root != cid:
+            cursor.execute("UPDATE events SET person_id = ? WHERE person_id = ?", (root, cid))
+    conn.commit()
+    final_count = len(set(_find_root(cid) for cid in all_confirmed_ids))
+    print(f"[INFO] {len(all_confirmed_ids)} confirmed track(s) reconciled to "
+          f"{final_count} unique people. Merge history logged in 'identity_merges' table.\n")
+else:
+    print(f"\n[INFO] Identity reconciliation found no mergeable tracks "
+          f"({len(all_confirmed_ids)} confirmed track(s) stand as-is).\n")
+
 conn.commit()
 conn.close()
 video_capture.release()
 video_writer.release()
 
+_final_people_count = len(set(_find_root(cid) for cid in all_confirmed_ids)) if all_confirmed_ids else 0
+
 print("\n########################################")
 print("  AGENT 1 COMPLETE: DATABASE POPULATED  ")
 print("########################################")
 print(f"Total frames processed : {frame_count}")
-print(f"Total unique people    : {next_clean_id - 1}")
+print(f"Confirmed tracks (pre-merge) : {next_clean_id - 1}")
+print(f"Total unique people (post-reconciliation) : {_final_people_count}")
 print(f"Database location      : {DATABASE_PATH}")
 print(f"Output video           : {output_path}")
 print(f"Face crops saved to    : {face_crops_dir}")
 print()
 
-# Print face crop summary
 if best_face_crop:
     print("Best face crops saved:")
     for cid, path in sorted(best_face_crop.items()):

@@ -1,0 +1,49 @@
+# agent1_tracking/custom_tracker_botsort.yaml
+# Production tuning for wide-angle CCTV office spaces with heavy occlusions.
+#
+# This is the "Track ID" stage of the pipeline:
+#   YOLO -> BoT-SORT (this file) -> Track ID -> OSNet -> FAISS -> Persistent Person ID
+#
+# BoT-SORT does its OWN short-term appearance re-id internally (with_reid
+# below) to reduce ID switches frame-to-frame. That is separate from, and
+# much shorter-lived than, the persistent OSNet/FAISS gallery built on top of
+# it in agent1_persistent_reid.py - think of this as "don't lose the person
+# for the next few seconds" vs the gallery's "recognize this person even if
+# they left and came back an hour later."
+
+tracker_type: botsort
+
+# تحسينات للتعامل مع تغير الوضعية (الجلوس/الوقوف)
+track_low_thresh: 0.05
+track_high_thresh: 0.35    # خفض قليلاً لالتقاط حالات الجلوس
+
+# FIX: كان 0.65 - عالي جداً. أي شخص أول ظهور له بثقة أقل من الرقم ده (زي حد
+# واقف بضهره للكاميرا، إضاءة ضعيفة، أو مستحجب جزئياً بكرسي/divider) ما كانش
+# بياخد track من الأساس، يعني ما كانش بيوصل حتى لمرحلة الـ probation أو الـ
+# ReID - كان بيختفي تماماً من الفيديو بدون أي ID. رجّعناه لرقم أوسط وسيبنا
+# فلترة الـ false positives تحصل عن طريق MIN_FRAMES_TO_CONFIRM (موجودة أصلاً
+# في agent1_persistent_reid.py) بدل رفض أي شخص صعب الرؤية من أول فريم.
+new_track_thresh: 0.5
+
+track_buffer: 300          # زيادة الذاكرة لـ 10 ثوانٍ (30fps)
+
+match_thresh: 0.80         # رفع عتبة المطابقة قليلاً
+fuse_score: True
+
+# --- BoT-SORT specific: camera motion compensation ---
+# Set to "none" if this is a locked-off CCTV camera (no pan/tilt/zoom/shake).
+# "sparseOptFlow" is a good default if the camera has any handheld/PTZ motion.
+gmc_method: sparseOptFlow
+
+# --- BoT-SORT specific: built-in short-term appearance ReID ---
+with_reid: True
+model: auto                # "auto" lets Ultralytics pick/download a lightweight embedder;
+                         # point this at a specific ReID .pt weight for better accuracy
+proximity_thresh: 0.4     # خفض عتبة IoU للسماح بمزيد من الربط
+appearance_thresh: 0.20   # خفض قليلاً لمرونة أكبر مع تحسينات ReID
+
+# ملاحظة: تمت إزالة "occlusion_threshold" و "reappear_threshold" من هنا -
+# هذان المفتاحان غير موجودَين فعلياً في مخطط إعدادات BoT-SORT الخاص بـ
+# Ultralytics، فكانت تُقرأ وتُتجاهل بصمت دون أي تأثير حقيقي. التعامل الفعلي
+# مع الحجب يحدث في كود بايثون عبر كلاس OcclusionHandler في
+# agent1_persistent_reid.py (وليس عبر ملف الإعدادات هذا).

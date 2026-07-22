@@ -1,0 +1,33 @@
+# requirements for agent1_persistent_reid.py
+# (in addition to whatever agent1.py already needed: ultralytics, opencv-python)
+
+ultralytics>=8.4.0        # YOLO26 (yolo26l.pt etc.) was added in 8.4.0 - anything older won't recognize the model name
+opencv-python
+numpy
+faiss-cpu                 # swap for faiss-gpu if you have CUDA and want faster search at scale
+
+# Appearance embedder (OSNet). If torchreid or its pretrained weights aren't
+# reachable in your environment, agent1_persistent_reid.py automatically
+# falls back to a plain ResNet50 ImageNet embedder - install these two for
+# that fallback path even if you skip torchreid:
+torch>=1.9.0
+torchvision>=0.10.0
+
+# For the real OSNet embedder (recommended for production accuracy):
+torchreid
+gdown       # torchreid uses this to download OSNet's pretrained weights
+tensorboard # torchreid imports this internally for training-loop logging,
+            # even though we only use it for inference here - it still
+            # errors out at import time without it
+yacs        # torchreid's config system
+h5py        # used by torchreid's dataset/checkpoint loading code
+future      # torchreid compatibility shim
+imageio     # torchreid image I/O utilities
+Cython      # speeds up torchreid's metric evaluation code (rank.py warns
+            # and falls back to slow pure-python eval without it, but still
+            # runs either way)
+# NOTE: if you still hit a "No module named 'X'" error after installing all
+# of the above, it means torchreid was installed with something like
+# `--no-deps` or from a partial git checkout - the cleanest fix at that
+# point is: pip uninstall torchreid && pip install torchreid (plain, no
+# --no-deps flag), which pulls in its full dependency list automatically.
