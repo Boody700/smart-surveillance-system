@@ -1,7 +1,7 @@
 import sqlite3
 import os
 # We can import config directly now because of the -m flag
-from config2 import DATABASE_PATH
+from config import DATABASE_PATH
 
 # Ensure directory exists
 os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)

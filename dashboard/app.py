@@ -802,7 +802,7 @@ with tab1:
             if not os.path.exists(selected_video):
                 st.error("Please upload a video first.")
             else:
-                agent1_path = os.path.join(ROOT_DIR, "agent1_tracking", "agent1gamal.py")
+                agent1_path = os.path.join(ROOT_DIR, "agent1_tracking", "agent1t.py")
                 if not os.path.exists(agent1_path):
                     st.error(f"agent1.py not found at {agent1_path}")
                 else:
@@ -872,7 +872,7 @@ with tab2:
         )
 
         if check_btn:
-            agent2_path = os.path.join(ROOT_DIR, "agent2_rules", "agent2cl.py")
+            agent2_path = os.path.join(ROOT_DIR, "agent2_rules", "agent2.py")
             if not os.path.exists(agent2_path):
                 st.error(f"agent2.py not found at {agent2_path}")
             else:
@@ -1008,7 +1008,7 @@ with tab3:
     )
 
     if report_btn:
-        agent4_path = os.path.join(ROOT_DIR, "agent4_dashboard", "agent4.py")
+        agent4_path = os.path.join(ROOT_DIR, "agent4_dashboard", "agent4cl.py")
         if os.path.exists(agent4_path):
             # Streamed like Agents 1 & 2 rather than a silent subprocess.run -
             # the per-person LLM narrative calls (llama3.1:8b via Ollama) take

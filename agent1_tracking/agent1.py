@@ -1,4 +1,4 @@
-# # agent1_tracking/agent1_persistent_reid.py
+# agent1_tracking/agent1_persistent_reid.py
 #
 # Agent 1: Full production pipeline with PERSISTENT, APPEARANCE-BASED
 # person re-identification.
@@ -21,6 +21,7 @@ import os
 import sys
 import cv2
 import sqlite3
+import json
 import numpy as np
 import faiss
 import time
@@ -30,7 +31,7 @@ from ultralytics import YOLO
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT_DIR)
 
-from config2 import (
+from config import (
     VIDEO_PATH, MODEL_NAME, DATABASE_PATH,
     REID_MODEL_NAME, REID_WEIGHTS_PATH, EMBEDDING_DIM, REID_MATCH_THRESHOLD, MIN_CROP_SIZE,
     HYBRID_MATCH_WEIGHTS, TEMPORAL_MEMORY_LENGTH, RECHECK_INTERVAL_FRAMES,
@@ -41,16 +42,43 @@ from config2 import (
     FACE_MODEL_PATH, PHONE_MODEL_PATH,
     PHONE_CONF, PHONE_IOU, PHONE_COCO_FALLBACK_CONF, PHONE_COCO_FALLBACK_IOU,
     PHONE_DETECT_EVERY_N_FRAMES,
-    FACE_CONF, FACE_IOU, FACE_CROP_PAD_RATIO, FACE_DETECT_EVERY_N_FRAMES
+    FACE_CONF, FACE_IOU, FACE_CROP_PAD_RATIO, FACE_DETECT_EVERY_N_FRAMES,
+    # --- added: pose estimation pass for sleeping detection ---
+    POSE_MODEL_PATH, POSE_CONF, POSE_DETECT_EVERY_N_FRAMES,
+    SLEEP_FACE_VISIBILITY_THRESHOLD, SLEEP_FACE_RECENCY_FRAMES,
+    SLEEP_MIN_CONSECUTIVE_FRAMES, SLEEP_GRACE_FRAMES,
+    # --- added: only count a phone as "in use" if it overlaps a tracked
+    # person's box, not just anywhere in frame (e.g. charging on a table) ---
+    PHONE_MIN_PERSON_OVERLAP
 )
+
+# app.py's "Start Detection" button calls this script as:
+#   subprocess.Popen([sys.executable, agent1_path] + [selected_video], ...)
+# i.e. it passes whatever video was uploaded through the Streamlit UI as
+# sys.argv[1]. Without this override, that upload was silently ignored and
+# agent1 always processed config2.py's hardcoded VIDEO_PATH instead.
+if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
+    VIDEO_PATH = sys.argv[1]
+    print(f"[INFO] Using video path passed from app.py: {VIDEO_PATH}")
+
+# app.py's live-preview panel (Tab 1) polls this exact path and displays
+# whatever's there whenever it sees a "PROGRESS:" line on stdout - see the
+# write + print calls added at the end of the main loop below. Must match
+# app.py's LIVE_FRAME_PATH = os.path.join(ROOT_DIR, "live_frame.jpg") exactly
+# (same ROOT_DIR-from-__file__ computation on both sides, so this resolves
+# to the same path as long as this script's own directory nesting matches
+# app.py's).
+LIVE_FRAME_PATH = os.path.join(ROOT_DIR, "live_frame.jpg")
+LIVE_FRAME_WRITE_EVERY_N_FRAMES = 15  # matches app.py's own UPDATE_EVERY_FRAMES cadence
 print("\n=== AGENT 1 STARTING: TRACKING + PERSISTENT RE-ID + DATABASE FEED ===")
 
 # ---------------------------------------------------------------------------
-# CLASS: Temporal Memory - تتبع المواقع السابقة
+# CLASS: Temporal Memory - tracking previous positions
 # ---------------------------------------------------------------------------
 class TemporalMemory:
     """
-    تخزين المواقع والمميزات السابقة لكل معرف لتتبع الحركة وتحسين المطابقة
+    Stores previous positions and features for each ID to track movement
+    and improve matching.
     """
     def __init__(self, max_history=TEMPORAL_MEMORY_LENGTH):
         self.history = {}  # person_id -> deque of (frame, bbox, embedding)
@@ -62,15 +90,15 @@ class TemporalMemory:
         self.history[person_id].append((frame_count, bbox, embedding))
     
     def get_spatial_score(self, person_id, current_bbox, max_distance=150):
-        """حساب التشابه المكاني مع المواقع السابقة"""
+        """Compute spatial similarity against previous positions."""
         if person_id not in self.history or not self.history[person_id]:
             return 0.0
         
-        # حساب مركز الصندوق الحالي
+        # Center of the current box
         cx1 = (current_bbox[0] + current_bbox[2]) / 2
         cy1 = (current_bbox[1] + current_bbox[3]) / 2
         
-        # أقل مسافة من آخر 5 مواقع
+        # Minimum distance from the last 5 positions
         min_distance = float('inf')
         for _, last_bbox, _ in list(self.history[person_id])[-5:]:
             cx2 = (last_bbox[0] + last_bbox[2]) / 2
@@ -82,11 +110,11 @@ class TemporalMemory:
         if min_distance == float('inf'):
             return 0.0
         
-        # تحويل المسافة إلى درجة تشابه (0-1)
+        # Convert distance to a similarity score (0-1)
         return max(0, 1 - min_distance / max_distance)
     
     def get_temporal_score(self, person_id, current_frame, max_gap=300):
-        """حساب التشابه الزمني - كلما كان آخر ظهور قريباً، زادت الثقة"""
+        """Compute temporal similarity - the more recent the last sighting, the higher the confidence."""
         if person_id not in self.history or not self.history[person_id]:
             return 0.0
         
@@ -99,11 +127,11 @@ class TemporalMemory:
         return max(0.5, 1 - frames_gap / max_gap)
     
     def get_predicted_bbox(self, person_id, current_bbox):
-        """توقع الموقع باستخدام نموذج حركة بسيط"""
+        """Predict position using a simple motion model."""
         if person_id not in self.history or len(self.history[person_id]) < 3:
             return current_bbox
         
-        # حساب متوسط السرعة من آخر 5 إطارات
+        # Compute average velocity from the last 5 frames
         recent = list(self.history[person_id])[-5:]
         if len(recent) < 2:
             return current_bbox
@@ -130,11 +158,11 @@ class TemporalMemory:
         return current_bbox
 
 # ---------------------------------------------------------------------------
-# CLASS: Occlusion Handler - التعامل مع الحجب
+# CLASS: Occlusion Handler
 # ---------------------------------------------------------------------------
 class OcclusionHandler:
     """
-    تتبع حالات الحجب وتوقع المواقع أثناء الحجب
+    Tracks occlusion states and predicts positions during occlusion.
     """
     def __init__(self, max_frames=MAX_FRAMES_OCCLUDED, search_scale=OCCLUSION_SEARCH_SCALE):
         self.max_frames = max_frames
@@ -155,7 +183,7 @@ class OcclusionHandler:
                 del self.occluded[track_id]
     
     def get_search_region(self, track_id, frame_shape):
-        """توسيع منطقة البحث عند الحجب"""
+        """Expand the search region while occluded."""
         if track_id not in self.occluded:
             return None
         
@@ -194,7 +222,7 @@ class PersonEmbedder:
         self.device = device
         self.dim = EMBEDDING_DIM
         self.backend = None
-        self.embed_cache = {}  # تخزين مؤقت للمميزات لتسريع المعالجة
+        self.embed_cache = {}  # cache for embeddings to speed up processing
 
         try:
             from torchreid.reid.utils import FeatureExtractor
@@ -277,7 +305,7 @@ class PersonEmbedder:
     def embed(self, crop_bgr, use_cache=False):
         """crop_bgr: HxWx3 uint8 BGR image (straight from cv2). Returns an L2-normalized np.float32 vector."""
         if use_cache:
-            # استخدام تجزئة الصورة كمفتاح للتخزين المؤقت (تقريبياً)
+            # Use a hash of the crop as a (rough) cache key
             import hashlib
             crop_hash = hashlib.md5(crop_bgr.tobytes()).hexdigest()
             if crop_hash in self.embed_cache:
@@ -299,7 +327,7 @@ class PersonEmbedder:
         
         if use_cache:
             self.embed_cache[crop_hash] = vec
-            if len(self.embed_cache) > 100:  # تنظيف التخزين المؤقت
+            if len(self.embed_cache) > 100:  # clear the cache periodically
                 self.embed_cache.clear()
         
         return vec
@@ -362,10 +390,11 @@ class PersonGallery:
         """Returns (person_id, similarity) for the best match above threshold, else (None, best_sim_seen)."""
         if self.index.ntotal == 0:
             return None, 0.0
-        sims, idxs = self.index.search(vec.reshape(1, -1), min(3, self.index.ntotal))  # أفضل 3 مطابقات (أو أقل إذا كان المعرض صغيراً)
+        sims, idxs = self.index.search(vec.reshape(1, -1), min(3, self.index.ntotal))  # top 3 matches (or fewer if the gallery is small)
 
-        # فحص أفضل المطابقات - مع IndexIDMap، idxs تحتوي على person_id مباشرة
-        # (وليس رقم صف يحتاج لترجمة عبر self.person_ids كما كان سابقاً)
+        # Check the top matches - with IndexIDMap, idxs already contain the
+        # person_id directly (no translation through self.person_ids needed,
+        # unlike before)
         for i in range(len(idxs[0])):
             best_sim = float(sims[0][i])
             best_person_id = int(idxs[0][i])
@@ -374,7 +403,7 @@ class PersonGallery:
             if best_sim >= threshold:
                 return best_person_id, best_sim
 
-        # إذا لم يكن هناك مطابقة فوق العتبة، نعيد أفضل مطابقة مع درجة التشابه
+        # If nothing cleared the threshold, return the best match along with its similarity score
         if len(idxs[0]) > 0 and idxs[0][0] != -1:
             return None, float(sims[0][0])
         return None, 0.0
@@ -390,12 +419,12 @@ class PersonGallery:
                 VALUES (?, ?, 1, ?, ?)
             """, (person_id, vec.astype(np.float32).tobytes(), frame_count, frame_count))
         else:
-            # المتوسط المتحرك المرجح - إعطاء وزن أكبر للمميزات الجديدة الموثوقة
+            # Weighted moving average - give more weight to newer, reliable features
             n = self.sample_counts[person_id]
             old_vec = self.embeddings[person_id]
             
-            # عامل التعلم التكيفي - كلما زاد عدد العينات، قل وزن العينة الجديدة
-            alpha = min(0.5, 0.3 * confidence)  # معدل التعلم التكيفي
+            # Adaptive learning rate - the more samples we have, the less weight a new sample gets
+            alpha = min(0.5, 0.3 * confidence)  # adaptive learning rate
             new_vec = (1 - alpha) * old_vec + alpha * vec
             norm = np.linalg.norm(new_vec)
             if norm > 0:
@@ -405,9 +434,10 @@ class PersonGallery:
             self.sample_counts[person_id] = n + 1
             self.last_seen_frame[person_id] = frame_count
 
-            # تحديث المتجه في الفهرس مباشرة (O(1)) بدلاً من إعادة بناء الفهرس
-            # بالكامل من كل المعرفات في كل مرة - كان هذا يصبح أبطأ كلما زاد
-            # عدد الأشخاص وطالت مدة الفيديو
+            # Update the vector in the index directly (O(1)) instead of
+            # rebuilding the whole index from every identity each time -
+            # this used to get slower the more people appeared and the
+            # longer the video ran
             self.index.remove_ids(np.array([person_id], dtype=np.int64))
             self.index.add_with_ids(new_vec.reshape(1, -1), np.array([person_id], dtype=np.int64))
 
@@ -426,13 +456,13 @@ class PersonGallery:
         return (row[0] or 0) + 1
     
     def merge_identities(self, primary_id, duplicate_id, frame_count):
-        """دمج معرفين في معرف واحد - إصلاح المعرفات المكررة"""
+        """Merge two identities into one - fixes duplicate identities."""
         if duplicate_id not in self.embeddings or primary_id not in self.embeddings:
             return
         
         print(f"[MERGE] Merging person {duplicate_id} into {primary_id}")
         
-        # دمج المميزات
+        # Merge the features
         primary_embed = self.embeddings[primary_id]
         duplicate_embed = self.embeddings[duplicate_id]
         n1 = self.sample_counts[primary_id]
@@ -441,7 +471,7 @@ class PersonGallery:
         merged_embed = (primary_embed * n1 + duplicate_embed * n2) / (n1 + n2)
         merged_embed = merged_embed / np.linalg.norm(merged_embed)
         
-        # تحديث المميزات
+        # Update the features
         self.embeddings[primary_id] = merged_embed
         self.sample_counts[primary_id] = n1 + n2
         self.last_seen_frame[primary_id] = max(
@@ -449,15 +479,16 @@ class PersonGallery:
             self.last_seen_frame.get(duplicate_id, 0)
         )
         
-        # حذف المعرف المكرر من القائمة والفهرس، وتحديث متجه المعرف الأساسي
-        # بالنتيجة المدموجة - كل هذا الآن O(1) بدلاً من إعادة بناء الفهرس بالكامل
+        # Remove the duplicate identity from the list/index, and update the
+        # primary identity's vector with the merged result - all of this is
+        # now O(1) instead of rebuilding the whole index
         if duplicate_id in self.person_ids:
             self.person_ids.remove(duplicate_id)
         self.index.remove_ids(np.array([duplicate_id], dtype=np.int64))
         self.index.remove_ids(np.array([primary_id], dtype=np.int64))
         self.index.add_with_ids(merged_embed.reshape(1, -1), np.array([primary_id], dtype=np.int64))
 
-        # حذف من قاعدة البيانات
+        # Remove from the database
         cur = self.conn.cursor()
         cur.execute("DELETE FROM person_gallery WHERE person_id = ?", (duplicate_id,))
         cur.execute("""
@@ -467,16 +498,16 @@ class PersonGallery:
         """, (merged_embed.astype(np.float32).tobytes(), n1 + n2, frame_count, primary_id))
         self.conn.commit()
         
-        # إزالة من الذاكرة المؤقتة
+        # Remove from in-memory caches
         self.embeddings.pop(duplicate_id, None)
         self.sample_counts.pop(duplicate_id, None)
         self.last_seen_frame.pop(duplicate_id, None)
 
 # ---------------------------------------------------------------------------
-# CLASS: Performance Monitor - مراقبة الأداء
+# CLASS: Performance Monitor
 # ---------------------------------------------------------------------------
 class PerformanceMonitor:
-    """مراقبة أداء النظام وتقديم تقارير"""
+    """Tracks system performance and produces reports."""
     def __init__(self):
         self.metrics = {
             'total_detections': 0,
@@ -573,10 +604,39 @@ frame_height = int(video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
 print(f"[INFO] Video: {total_frames} frames at {fps:.2f} FPS")
 
+# --- LOAD ZONES (visual only here - agent1 doesn't enforce zone rules,
+# that's Agent 2's job, but drawing them on the live/output feed makes it
+# easy to visually confirm calibration lines up with where people actually
+# sit before running the rule engine). ---
+zones_json_path = os.path.join(os.path.dirname(DATABASE_PATH), "zones.json")
+zone_polys_px = []
+if os.path.exists(zones_json_path):
+    try:
+        with open(zones_json_path, "r") as f:
+            zones_data = json.load(f).get("zones", [])
+        zone_polys_px = [
+            np.array([[p[0] * frame_width, p[1] * frame_height] for p in z], dtype=np.int32)
+            for z in zones_data
+        ]
+        print(f"[INFO] Loaded {len(zone_polys_px)} zone(s) from {zones_json_path}")
+    except Exception as e:
+        print(f"[WARN] Failed to load zones.json ({e}) - continuing without zone overlay.")
+else:
+    print(f"[WARN] No zones.json found at {zones_json_path} - continuing without zone overlay.")
+
+ZONE_COLOR = (255, 200, 0)  # cyan-ish - neutral, since agent1 has no concept of "whose" zone is whose (that's Agent 2)
+
+def draw_zones(frame):
+    for i, poly in enumerate(zone_polys_px):
+        cv2.polylines(frame, [poly], True, ZONE_COLOR, 2)
+        cx, cy = int(np.mean(poly[:, 0])), int(np.mean(poly[:, 1]))
+        cv2.putText(frame, f"Zone {i}", (cx - 30, cy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, ZONE_COLOR, 2)
+
 # --- SET UP OUTPUT VIDEO FOR VISUAL VERIFICATION ---
 output_dir = os.path.join(ROOT_DIR, "output_videos")
 os.makedirs(output_dir, exist_ok=True)
-output_path = os.path.join(output_dir, "output_agent1_persistent_reid_improved.mp4")
+output_path = os.path.join(output_dir, "output_agent1_new2.mp4")
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 video_writer = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
@@ -606,6 +666,43 @@ if os.path.exists(FACE_MODEL_PATH):
 else:
     print(f"[WARN] Face model not found at {FACE_MODEL_PATH} — face detection disabled for this run.")
 
+# --- POSE MODEL (own pass, scoped to each tracked person's box) ---
+# Used for sleeping detection: head-drop relative to shoulders + low nose
+# keypoint confidence (face pointed down/away from camera) is a decent
+# proxy for "slumped over the desk" without needing a dedicated
+# sleep-classification model.
+#
+# NOTE: unlike phone_model/face_model above, this is a stock Ultralytics
+# pretrained checkpoint (like MODEL_NAME), not a custom-trained local
+# weights file - it auto-downloads on first use if not already cached, the
+# same way `model = YOLO(MODEL_NAME)` does. No os.path.exists gate needed
+# (an earlier version of this incorrectly gated it the same way as the
+# phone/face models and would have silently disabled sleeping detection).
+print(f"[INFO] Loading pose model: {POSE_MODEL_PATH}")
+pose_model = YOLO(POSE_MODEL_PATH)
+
+# person_id -> {"consecutive": int, "absent": int, "logged": bool}
+# consecutive: how many checked frames in a row looked like sleeping (must
+#              clear SLEEP_MIN_CONSECUTIVE_FRAMES before we trust it)
+# absent:      how many checked frames in a row did NOT look like sleeping
+#              (grace window before we consider the episode over, same
+#              pattern as GRACE_PERIOD_FRAMES elsewhere in this pipeline -
+#              avoids one head-bob resetting a real sleeping episode)
+# logged:      whether we've already written at least one row for this
+#              continuous episode
+sleeping_state = {}
+
+# person_id -> last frame_count at which the FACE pass (PASS 3c) actually
+# found a face for them. Used by the sleeping heuristic below: "face model
+# hasn't seen this person's face in a while" is a much more reliable signal
+# than trying to derive it purely from pose keypoint positions, since a
+# person fully slumped forward (arms as a pillow, face hidden entirely) can
+# make the pose model's NOSE position estimate unreliable garbage even
+# though its CONFIDENCE for that estimate is correctly low - so we lean on
+# confidence + this cross-pass signal rather than trusting keypoint
+# coordinates when the face isn't actually visible.
+last_face_seen_frame = {}
+
 def expand_box(box, pad_ratio, fw, fh):
     """Pad a bbox by pad_ratio on each side, clamped to frame bounds."""
     x1, y1, x2, y2 = box
@@ -613,7 +710,21 @@ def expand_box(box, pad_ratio, fw, fh):
     px, py = int(w * pad_ratio), int(h * pad_ratio)
     return (max(0, x1 - px), max(0, y1 - py), min(fw - 1, x2 + px), min(fh - 1, y2 + py))
 
-# تهيئة المكونات الإضافية
+def overlap_ratio(inner_box, outer_box):
+    """Fraction of inner_box's own area that falls inside outer_box. Used to
+    decide whether a detected phone is actually IN a person's bbox (usage)
+    vs just somewhere else in frame (e.g. charging on a table, not held by
+    anyone currently tracked)."""
+    ix1, iy1, ix2, iy2 = inner_box
+    ox1, oy1, ox2, oy2 = outer_box
+    inter_x1, inter_y1 = max(ix1, ox1), max(iy1, oy1)
+    inter_x2, inter_y2 = min(ix2, ox2), min(iy2, oy2)
+    inter_w, inter_h = max(0, inter_x2 - inter_x1), max(0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+    inner_area = max(1, (ix2 - ix1) * (iy2 - iy1))
+    return inter_area / inner_area
+
+# Initialize additional components
 temporal_memory = TemporalMemory()
 occlusion_handler = OcclusionHandler()
 performance_monitor = PerformanceMonitor()
@@ -625,12 +736,12 @@ track_to_person = {}          # bot_sort track_id -> persistent person_id
 track_bbox_history = {}       # track_id -> list of recent bboxes
 frames_since_recheck = {}     # bot_sort track_id -> frames since last embedding refresh
 track_hit_counts = {}         # bot_sort track_id -> consecutive frames seen (probation)
-person_id_to_track = {}       # person_id -> current track_id (للكشف عن تغييرات المعرف)
+person_id_to_track = {}       # person_id -> current track_id (for detecting identity changes)
 
 frame_count = 0
 
 def get_adjusted_bbox(track_id, bbox):
-    """تعديل الصندوق حسب آخر حجم معروف للشخص"""
+    """Adjust the box according to the person's last known size."""
     if track_id not in track_bbox_history:
         track_bbox_history[track_id] = []
     
@@ -643,7 +754,7 @@ def get_adjusted_bbox(track_id, bbox):
         avg_height = np.mean(heights)
         current_height = bbox[3] - bbox[1]
         
-        # إذا تغير الارتفاع بنسبة كبيرة، استخدم متوسط الارتفاع
+        # If the height changed by a large margin, use the average height instead
         if current_height > 0 and abs(current_height - avg_height) / avg_height > 0.3:
             scale = avg_height / current_height
             center_x = (bbox[0] + bbox[2]) / 2
@@ -660,12 +771,12 @@ def get_adjusted_bbox(track_id, bbox):
     return bbox
 
 def filter_crop(crop, min_size=MIN_CROP_SIZE, blur_threshold=50):
-    """تجاهل المقاطع الصغيرة جداً أو غير الواضحة"""
+    """Ignore crops that are too small or too blurry."""
     h, w = crop.shape[:2]
     if h < min_size or w < min_size:
         return False
     
-    # فحص الوضوح باستخدام تباين Laplacian
+    # Check sharpness using Laplacian variance
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
     return blur_score > blur_threshold
@@ -736,7 +847,7 @@ def get_ranked_candidates(track_id, track_person_id, current_bbox, embedding, fr
     return ranked
 
 def detect_and_fix_duplicate_ids():
-    """كشف وإصلاح المعرفات المكررة (نفس الشخص بمعرفات مختلفة)"""
+    """Detect and fix duplicate identities (the same person under different IDs)."""
     active_ids = list(set(track_to_person.values()))
     
     duplicate_groups = []
@@ -751,10 +862,10 @@ def detect_and_fix_duplicate_ids():
             if id2 in checked:
                 continue
             
-            # مقارنة المميزات بين المعرفين
+            # Compare features between the two identities
             if id1 in gallery.embeddings and id2 in gallery.embeddings:
                 sim = np.dot(gallery.embeddings[id1], gallery.embeddings[id2])
-                if sim > 0.90:  # عتبة عالية للدمج
+                if sim > 0.90:  # high threshold for merging
                     group.append(id2)
                     checked.add(id2)
         
@@ -762,14 +873,14 @@ def detect_and_fix_duplicate_ids():
             duplicate_groups.append(group)
             checked.update(group)
     
-    # دمج المعرفات المكررة
+    # Merge duplicate identities
     for group in duplicate_groups:
         primary_id = min(group)
         for duplicate_id in group:
             if duplicate_id != primary_id:
                 gallery.merge_identities(primary_id, duplicate_id, frame_count)
                 
-                # تحديث خريطة track_to_person
+                # Update the track_to_person map
                 for track_id, person_id in list(track_to_person.items()):
                     if person_id == duplicate_id:
                         track_to_person[track_id] = primary_id
@@ -786,7 +897,9 @@ while True:
     frame_count += 1
     current_timestamp = frame_count / fps
 
-    # تحديث حالة الحجب لكل معرف
+    draw_zones(frame)
+
+    # Update the occlusion state for each ID.
     # FIX: OCCLUSION EVICTION BUG - OcclusionHandler.max_frames (from
     # MAX_FRAMES_OCCLUDED in config.py) was stored on the object but NEVER
     # actually checked anywhere in the file. That meant an occluded
@@ -803,7 +916,7 @@ while True:
     # long-gap recovery) instead of lingering on dead bookkeeping.
     for track_id in list(occlusion_handler.occluded.keys()):
         if track_id in track_to_person:
-            # إذا كان المعرف لا يزال موجوداً ولم يظهر، نستمر في التتبع
+            # If the ID is still around but hasn't shown up, keep tracking it
             occlusion_handler.occluded[track_id]['frames'] += 1
 
         if occlusion_handler.occluded[track_id]['frames'] > occlusion_handler.max_frames:
@@ -853,25 +966,26 @@ while True:
             performance_monitor.log_detection()
             detected_track_ids.append(track_id)
 
-            # هذا الشخص ظهر مجدداً - تحقق مما إذا كان مُعلَّماً كمحجوب *قبل*
-            # حذفه من occlusion_handler (كان الكود القديم يحذفه فوراً هنا، مما
-            # يجعل فحص get_search_region أدناه ميت الكود دائماً لأنه لم يكن
-            # يجد track_id في occluded بعد الآن)
+            # This person showed up again - check whether it was flagged as
+            # occluded *before* removing it from occlusion_handler (the old
+            # code removed it immediately here, which meant the
+            # get_search_region check below was always dead code, since it
+            # could never find track_id in occluded anymore)
             was_occluded = track_id in occlusion_handler.occluded
             search_region = occlusion_handler.get_search_region(track_id, frame.shape) if was_occluded else None
             if was_occluded:
                 del occlusion_handler.occluded[track_id]
 
-            # --- Probation: لا نثق بالمعرف الجديد فوراً ---
+            # --- Probation: don't trust a new ID right away ---
             track_hit_counts[track_id] = track_hit_counts.get(track_id, 0) + 1
             if track_hit_counts[track_id] < MIN_FRAMES_TO_CONFIRM:
                 continue
 
-            # --- تعديل الصندوق حسب حجم الشخص ---
+            # --- Adjust the box based on the person's size ---
             adjusted_box = get_adjusted_bbox(track_id, box)
 
-            # --- التعامل مع الحجب: توسيع منطقة البحث إذا كان هذا الشخص
-            # محجوباً في الإطارات الأخيرة ---
+            # --- Handle occlusion: expand the search region if this person
+            # was occluded in recent frames ---
             if search_region:
                 adjusted_box = search_region
 
@@ -880,10 +994,10 @@ while True:
             x2c, y2c = min(frame_width, x2), min(frame_height, y2)
             crop = frame[y1c:y2c, x1c:x2c]
 
-            # التحقق من جودة المقاطع
+            # Check crop quality
             crop_is_usable = crop.size > 0 and filter_crop(crop)
 
-            # --- الحصول على المميزات ---
+            # --- Get the features ---
             need_embed = (
                 track_id not in track_to_person or
                 frames_since_recheck.get(track_id, RECHECK_INTERVAL_FRAMES) >= RECHECK_INTERVAL_FRAMES
@@ -908,10 +1022,11 @@ while True:
                 frames_since_recheck[track_id] = 0
             else:
                 frames_since_recheck[track_id] = frames_since_recheck.get(track_id, 0) + 1
-                # لم يُعَد استخراج مميزات هذا التتبع في هذا الإطار، لكنه ما
-                # زال يحمل معرّفاً حالياً - يجب اعتبار هذا المعرف "محجوزاً"
-                # في هذا الإطار بالذات، وإلا فقد يُعطى لاحقاً في PASS 2 لتتبع
-                # آخر يقترحه أيضاً (وهذا كان جزءاً من نفس الثغرة).
+                # This track's features weren't re-extracted this frame, but
+                # it still carries a current identity - that identity must
+                # be treated as "claimed" this exact frame, otherwise PASS 2
+                # could later hand it to another track that also proposes
+                # it (this was part of the same underlying bug).
                 if current_person_id is not None:
                     claimed_this_frame.add(current_person_id)
                 passthrough_hits.append({"track_id": track_id, "box": adjusted_box, "conf": conf})
@@ -948,7 +1063,8 @@ while True:
             temporal_memory.add_entry(current_person_id, frame_count, adjusted_box, vec)
 
         if assigned_id is not None:
-            # مطابقة ناجحة (قد تكون المرشح الأول أو مرشح بديل بعد تعارض)
+            # Successful match (could be the top candidate, or a fallback
+            # candidate after a conflict)
             if current_person_id is not None and current_person_id != assigned_id:
                 performance_monitor.log_id_switch(current_person_id, assigned_id, "reid_match")
 
@@ -994,7 +1110,7 @@ while True:
                 print(f"[KEEP] Track {track_id} -> Person {assigned_id} "
                       f"(no confident re-match, best alt sim: {best_sim:.3f} - kept prior identity)")
             else:
-                # شخص جديد فعلاً (أو تعارض بدون أي مرشح بديل متاح)
+                # A genuinely new person (or a conflict with no available alternative candidate)
                 assigned_id = gallery.next_person_id()
                 performance_monitor.log_identity(is_new=True)
                 gallery.upsert(assigned_id, vec, frame_count, is_new=True, confidence=1.0)
@@ -1031,7 +1147,7 @@ while True:
             x1, y1, x2, y2
         ))
 
-        # رسم صندوق وتعليق أصغر وأضيق على الفيديو - لون أخضر للمعرفات المستقرة
+        # Draw a smaller, tighter box and label on the video - green for stable IDs
         color = (0, 255, 0) if person_id in gallery.embeddings else (0, 255, 255)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1)
 
@@ -1043,9 +1159,18 @@ while True:
                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), 1)
 
     # --- PASS 3b: PHONE DETECTION — own model/pass, not part of person
-    # tracking above. No association to a specific person_id here (matches
-    # the original single-model pipeline's behavior); a rule engine can
-    # associate phone boxes with the nearest person bbox downstream if needed.
+    # tracking above. ONLY kept if it overlaps a currently tracked person's
+    # box - a phone sitting on a desk charging, or anywhere else no one is
+    # actively holding it, isn't "usage" and shouldn't be logged as such.
+    # No specific person_id association beyond that (still person_id=None,
+    # matching the original pipeline's behavior) - a rule engine downstream
+    # can associate it with the exact nearest person if that granularity is
+    # ever needed.
+    person_boxes_this_frame = [
+        hit["box"] for hit in reembed_proposals + passthrough_hits
+        if hit["track_id"] in track_to_person
+    ]
+
     if frame_count % PHONE_DETECT_EVERY_N_FRAMES == 0:
         if phone_model is not None:
             phone_results = phone_model.predict(
@@ -1061,6 +1186,16 @@ while True:
         if pboxes is not None and len(pboxes) > 0:
             for pbox, pconf in zip(pboxes.xyxy.int().tolist(), pboxes.conf.tolist()):
                 px1, py1, px2, py2 = pbox
+
+                # Skip phones not inside any currently tracked person's box -
+                # this is the actual "usage vs charging elsewhere" filter.
+                max_overlap = max(
+                    (overlap_ratio((px1, py1, px2, py2), pb) for pb in person_boxes_this_frame),
+                    default=0.0
+                )
+                if max_overlap < PHONE_MIN_PERSON_OVERLAP:
+                    continue
+
                 cursor.execute("""
                     INSERT INTO events
                         (timestamp, person_id, event_type, confidence,
@@ -1106,6 +1241,12 @@ while True:
             fx1, fy1, fx2, fy2 = fboxes.xyxy.int().tolist()[best_i]
             fconf = fconfs[best_i]
 
+            # A real face was found for this person this check - record it,
+            # the sleeping heuristic below (PASS 3d) uses this directly
+            # rather than re-deriving "is the face visible" from pose
+            # keypoints alone.
+            last_face_seen_frame[person_id] = frame_count
+
             # translate the face box from crop-local coords back to full-frame
             fx1_full, fy1_full = fx1 + ex1, fy1 + ey1
             fx2_full, fy2_full = fx2 + ex1, fy2 + ey1
@@ -1131,21 +1272,161 @@ while True:
             cv2.putText(frame, flabel, (fx1_full + 2, fy1_full - 3),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
 
-    # --- كشف المعرفات التي اختفت ---
+    # --- PASS 3d: POSE ESTIMATION — SLEEPING DETECTION. Own model/pass,
+    # scoped to each confirmed person's own bbox this frame, same throttle
+    # pattern as the face pass.
+    #
+    # Heuristic (v2 - revised after real-footage testing showed the original
+    # head-drop-ratio approach never fired): a person slumped fully forward
+    # with their head resting on/under their arms has EVERY facial keypoint
+    # (nose, both eyes, both ears) at genuinely low confidence, since none
+    # of them are visible at all - but the model still has to output SOME
+    # x/y coordinate for "nose" even when it can't see it, and that
+    # coordinate is often an unreliable guess rather than an accurate
+    # "here's where the head actually is" position. Gating on head-drop
+    # RATIO (a position) was fragile for exactly this reason. Gating on
+    # face-keypoint CONFIDENCE (nose/eyes/ears all low) combined with the
+    # face pass (PASS 3c) independently confirming it hasn't found an
+    # actual face for this person recently is far more robust, since it
+    # doesn't depend on trusting a coordinate the model was never
+    # confident about in the first place.
+    #
+    # COCO 17-keypoint order (Ultralytics pose models): 0 nose, 1 left eye,
+    # 2 right eye, 3 left ear, 4 right ear, 5 left shoulder, 6 right
+    # shoulder, 7 left elbow, 8 right elbow, 9 left wrist, 10 right wrist,
+    # 11 left hip, 12 right hip, 13 left knee, 14 right knee, 15 left
+    # ankle, 16 right ankle.
+    FACE_KPTS = [0, 1, 2, 3, 4]
+    L_SHOULDER, R_SHOULDER = 5, 6
+
+    if pose_model is not None and frame_count % POSE_DETECT_EVERY_N_FRAMES == 0:
+        pose_check_hits = [
+            hit for hit in reembed_proposals + passthrough_hits
+            if hit["track_id"] in track_to_person
+        ]
+        print(f"[POSE-DEBUG] Frame {frame_count}: checking {len(pose_check_hits)} tracked person(s) for sleeping.")
+
+        for hit in pose_check_hits:
+            track_id = hit["track_id"]
+            person_id = track_to_person[track_id]
+            x1, y1, x2, y2 = hit["box"]
+            crop = frame[max(0, y1):min(frame_height, y2), max(0, x1):min(frame_width, x2)]
+            if crop.size == 0:
+                continue
+
+            state = sleeping_state.setdefault(person_id, {"consecutive": 0, "absent": 0, "logged": False})
+
+            pose_results = pose_model.predict(crop, conf=POSE_CONF, imgsz=320, verbose=False)
+            pboxes = pose_results[0].boxes
+            keypoints = pose_results[0].keypoints
+            if pboxes is None or len(pboxes) == 0 or keypoints is None or keypoints.conf is None:
+                # No pose at all this check - a missed check, not evidence
+                # either way, so it only counts toward the grace window.
+                print(f"[POSE-DEBUG] Person {person_id}: NO POSE DETECTED IN CROP "
+                      f"(pboxes={0 if pboxes is None else len(pboxes)}, "
+                      f"keypoints_present={keypoints is not None}) "
+                      f"crop_shape={crop.shape}")
+                state["absent"] += 1
+                if state["absent"] > SLEEP_GRACE_FRAMES:
+                    state["consecutive"] = 0
+                    state["logged"] = False
+                continue
+
+            best_i = int(pboxes.conf.argmax())
+            kpts_conf = keypoints.conf[best_i].tolist()
+            kpts_xy = keypoints.xy[best_i].tolist()
+            if len(kpts_conf) < 7:
+                print(f"[POSE-DEBUG] Person {person_id}: keypoints returned but too few "
+                      f"({len(kpts_conf)} - expected 17). Wrong pose model/task?")
+                state["absent"] += 1
+                continue
+
+            crop_h = crop.shape[0]
+            face_visible_score = max(kpts_conf[i] for i in FACE_KPTS)
+            l_sh_conf, r_sh_conf = kpts_conf[L_SHOULDER], kpts_conf[R_SHOULDER]
+            shoulders_visible = l_sh_conf >= 0.3 or r_sh_conf >= 0.3
+
+            # Bringing this back: on the real data, face-keypoint confidence
+            # alone gave a real but SUBTLE gap (0.73-0.87 sleeping vs
+            # 0.99-1.00 awake) - not the near-zero drop I assumed. Position
+            # (how far the nose keypoint sits below the shoulders, as a
+            # fraction of crop height) should be a much starker, more
+            # reliable signal for someone whose head is genuinely down near
+            # table height, so logging it alongside confidence this round
+            # to see the actual separation before picking a combined rule.
+            head_drop_ratio = None
+            if l_sh_conf >= 0.3 or r_sh_conf >= 0.3:
+                shoulder_y = np.mean([y for (x, y), c in
+                                       zip([kpts_xy[L_SHOULDER], kpts_xy[R_SHOULDER]], [l_sh_conf, r_sh_conf])
+                                       if c >= 0.3])
+                nose_y = kpts_xy[FACE_KPTS[0]][1]
+                head_drop_ratio = (nose_y - shoulder_y) / crop_h
+
+            frames_since_face = frame_count - last_face_seen_frame.get(person_id, -10**9)
+            face_recently_seen = frames_since_face <= SLEEP_FACE_RECENCY_FRAMES
+
+            is_sleeping_candidate = (
+                shoulders_visible and
+                face_visible_score < SLEEP_FACE_VISIBILITY_THRESHOLD and
+                not face_recently_seen
+            )
+
+            hdr_str = f"{head_drop_ratio:.3f}" if head_drop_ratio is not None else "N/A"
+            print(f"[POSE-DEBUG] Person {person_id}: face_visible_score={face_visible_score:.2f} "
+                  f"head_drop_ratio={hdr_str} shoulders_visible={shoulders_visible} "
+                  f"frames_since_face={frames_since_face} "
+                  f"-> candidate={is_sleeping_candidate} (consecutive={state['consecutive']})")
+
+            if is_sleeping_candidate:
+                state["consecutive"] += 1
+                state["absent"] = 0
+            else:
+                state["absent"] += 1
+                if state["absent"] > SLEEP_GRACE_FRAMES:
+                    # Episode over - reset so the next one has to earn
+                    # SLEEP_MIN_CONSECUTIVE_FRAMES again rather than
+                    # instantly re-triggering off a stale streak.
+                    state["consecutive"] = 0
+                    state["logged"] = False
+
+            if state["consecutive"] >= SLEEP_MIN_CONSECUTIVE_FRAMES:
+                cursor.execute("""
+                    INSERT INTO events
+                        (timestamp, person_id, event_type, confidence,
+                         bbox_x1, bbox_y1, bbox_x2, bbox_y2)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    round(current_timestamp, 3),
+                    person_id,
+                    "sleeping_detected",
+                    round(1.0 - face_visible_score, 4),  # lower face visibility == higher confidence in the sleeping call
+                    x1, y1, x2, y2
+                ))
+                state["logged"] = True
+
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 200), 2)
+                slabel = f"SLEEPING P{person_id}"
+                (sw, sh_txt), _ = cv2.getTextSize(slabel, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+                cv2.rectangle(frame, (x1, y2), (x1 + sw + 4, y2 + sh_txt + 6), (0, 0, 200), -1)
+                cv2.putText(frame, slabel, (x1 + 2, y2 + sh_txt + 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+    # --- Detect the IDs that have disappeared ---
     for track_id in list(track_to_person.keys()):
         if track_id not in detected_track_ids:
-            # هذا المعرف لم يظهر في الإطار الحالي
+            # This ID didn't show up in the current frame
             if track_id not in occlusion_handler.occluded:
-                # استخدام آخر صندوق حقيقي معروف لهذا المعرف بدلاً من None -
-                # get_search_region يفك bbox[0]..bbox[3] حسابياً، وتمرير None
-                # هنا كان سيسبب TypeError أول مرة تُستخدم فيها منطقة البحث
+                # Use the last real known box for this ID instead of None -
+                # get_search_region unpacks bbox[0]..bbox[3] arithmetically,
+                # so passing None here would raise a TypeError the first
+                # time the search region gets used
                 last_known_bbox = None
                 if track_bbox_history.get(track_id):
                     last_known_bbox = track_bbox_history[track_id][-1]
                 if last_known_bbox is not None:
                     occlusion_handler.update(track_id, True, last_known_bbox)
 
-    # --- كشف وإصلاح المعرفات المكررة كل 100 إطار ---
+    # --- Detect and fix duplicate identities every 100 frames ---
     # FIX: only run auto-merge when using the real OSNet embedder. The
     # ResNet50 fallback is a generic ImageNet classifier, not trained for
     # person re-id - two DIFFERENT people wearing similarly-colored clothes
@@ -1193,10 +1474,22 @@ while True:
     cv2.putText(frame, backend_label, (10, frame_height - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, backend_color, 2)
 
+    # --- Feed app.py's live-preview panel. Throttled to the same cadence
+    # app.py polls at (every 15 frames) - writing a full JPEG every single
+    # frame at 30fps is needless disk I/O for a preview that's only ever
+    # refreshed every 15th frame on the receiving end anyway. The PROGRESS
+    # line is cheap to print every throttled step and is what
+    # run_agent_with_progress() in app.py is specifically watching stdout
+    # for - without it, the progress bar and image panel never update
+    # regardless of what's on disk.
+    if frame_count % LIVE_FRAME_WRITE_EVERY_N_FRAMES == 0 or frame_count >= total_frames:
+        cv2.imwrite(LIVE_FRAME_PATH, frame)
+        print(f"PROGRESS:{frame_count}:{total_frames}")
+
     # Write annotated frame to output video
     video_writer.write(frame)
 
-# --- تقرير الأداء النهائي ---
+# --- Final performance report ---
 performance_monitor.print_report(frame_count, len(gallery.person_ids))
 
 # --- FINAL COMMIT AND CLEANUP ---
