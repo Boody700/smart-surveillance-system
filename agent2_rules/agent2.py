@@ -35,6 +35,17 @@ ZONE_THRESHOLD  = 10   # was 20 - "being in another zone for more than 10 second
 CROPS_DIR       = os.path.join(ROOT_DIR, "violations")
 os.makedirs(CROPS_DIR, exist_ok=True)
 
+# Reserved sentinel for violations that are NOT tied to any single tracked
+# person - e.g. "the whole room was empty". Never a real person_id, since
+# Agent 1's gallery.next_person_id() (MAX(person_id)+1 over person_gallery)
+# always starts real tracked people at 1. Used instead of NULL so every
+# consumer downstream (Agent 4's PDF report, app.py's violation views, any
+# direct DB query) can treat "not a person" as one consistent, comparable
+# value rather than some rows being NULL and others 0. This never shows up
+# in `events` WHERE event_type='detected', so it never inflates any
+# per-person count (e.g. Agent 4's len(people) or app.py's "People" metric).
+GENERAL_PERSON_ID = 0
+
 # Phone usage: how sustained the phone-near-face signal needs to be before
 # it's a violation rather than a brief glance/reach.
 PHONE_USAGE_MIN_SECONDS   = 20  # was 5
@@ -203,7 +214,10 @@ def annotate_and_save(frame, pid, x1, y1, x2, y2, home_zone, polys, label, durat
     if x1 is not None:
         cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), COLOR_PERSON, 3)
 
-    viol_text = f"{label}" if pid is None else f"{label} | Person {pid}"
+    # GENERAL_PERSON_ID (0) is not a real tracked person - render it the
+    # same way as pid=None (no "| Person X" suffix), rather than literally
+    # printing "| Person 0" on the annotated frame.
+    viol_text = f"{label}" if pid is None or pid == GENERAL_PERSON_ID else f"{label} | Person {pid}"
     (tw, th), _ = cv2.getTextSize(viol_text, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
     lx = 10 if x1 is None else int(x1)
     ly = 40
@@ -371,7 +385,15 @@ def process_empty_room(polys, video_duration):
     stretch of time where NOBODY was detected in frame at all - built from
     the union of every person's 'detected' timestamps globally, not any
     one person's zone logic. Checks both gaps BETWEEN sightings and a
-    trailing gap if the room is still empty when the video ends."""
+    trailing gap if the room is still empty when the video ends.
+
+    Logged with person_id = GENERAL_PERSON_ID (0), NOT None/NULL - this was
+    the only place in the whole pipeline that ever wrote a NULL person_id
+    into a violation_* row (every other violation type here is always tied
+    to a real pid). NULL vs a distinct sentinel matters downstream: without
+    it, sorted()'ing person_ids anywhere (Agent 4's PDF builder) crashes on
+    comparing None to int, and any raw DB browse/count shows a phantom
+    "4th person" that was never actually a tracked identity."""
     conn = sqlite3.connect(DATABASE_PATH)
     rows = conn.execute("""
         SELECT DISTINCT timestamp FROM events WHERE event_type = 'detected'
@@ -395,9 +417,9 @@ def process_empty_room(polys, video_duration):
             print(f"  [VIOLATION] Room was completely empty for {gap:.0f} seconds "
                   f"(from {format_timestamp(prev_ts)} to {format_timestamp(next_ts)})")
             frame_img = grab_frame(mid_ts)
-            crop = annotate_and_save(frame_img, None, None, None, None, None,
+            crop = annotate_and_save(frame_img, GENERAL_PERSON_ID, None, None, None, None,
                                       None, polys, "EMPTY_ROOM", gap, f"{int(mid_ts)}_empty_room")
-            log_violation(None, "violation_empty_room", prev_ts, gap,
+            log_violation(GENERAL_PERSON_ID, "violation_empty_room", prev_ts, gap,
                           crop, None, None, None, None, None, None, None)
             print(f"  [DB] Logged (deterministic - no VLM call)")
 
@@ -410,9 +432,9 @@ def process_empty_room(polys, video_duration):
         print(f"  [VIOLATION] Room was empty for the final {tail_gap:.0f} seconds of the video "
               f"(from {format_timestamp(last_ts)} onward)")
         frame_img = grab_frame(mid_ts)
-        crop = annotate_and_save(frame_img, None, None, None, None, None,
+        crop = annotate_and_save(frame_img, GENERAL_PERSON_ID, None, None, None, None,
                                   None, polys, "EMPTY_ROOM", tail_gap, f"{int(mid_ts)}_empty_room_end")
-        log_violation(None, "violation_empty_room", last_ts, tail_gap,
+        log_violation(GENERAL_PERSON_ID, "violation_empty_room", last_ts, tail_gap,
                       crop, None, None, None, None, None, None, None)
         print(f"  [DB] Logged (deterministic - no VLM call)")
 
@@ -482,6 +504,7 @@ def main():
         # PHASE 2: VIOLATIONS
         outside_start     = None
         outside_start_det = None
+        home_return_start = None  # when we most recently started seeing them back home, pending confirmation
         afk_logged        = False
         unauth_logged     = False
         last_det          = detections[-1]
@@ -496,9 +519,30 @@ def main():
             curr_zone = get_zone(cx, cy, polys)
 
             if curr_zone == home_zone:
-                outside_start     = None
-                outside_start_det = None
+                # FIX: a single noisy frame reading "home zone" mid-absence
+                # (tracking jitter, a brief occlusion glitch, bbox center
+                # clipping the polygon edge) used to instantly reset
+                # outside_start to None - fragmenting one real 90-second
+                # absence into two 45-second pieces, neither of which
+                # reaches AFK_THRESHOLD/ZONE_THRESHOLD on its own, silently
+                # losing the whole violation. Now requires ZONE_THRESHOLD
+                # seconds of SUSTAINED home presence before treating it as
+                # a genuine return - outside_start (and therefore time_away)
+                # keeps accumulating through any shorter blip.
+                if home_return_start is None:
+                    home_return_start = ts
+                if ts - home_return_start >= ZONE_THRESHOLD:
+                    outside_start     = None
+                    outside_start_det = None
+                    # afk_logged/unauth_logged reset only on a CONFIRMED
+                    # return - see fix above this one: they used to only
+                    # ever go True, silently blocking every later separate
+                    # departure for the rest of the video.
+                    afk_logged    = False
+                    unauth_logged = False
                 continue
+            else:
+                home_return_start = None  # any non-home reading cancels a pending "return" confirmation
 
             if outside_start is None:
                 outside_start     = ts

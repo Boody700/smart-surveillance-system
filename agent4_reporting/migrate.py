@@ -1,4 +1,4 @@
-# migrate_general_violations.py
+# agent4_reporting/migrate.py
 #
 # One-time cleanup: existing violation_* rows with person_id IS NULL get
 # reassigned to person_id = 0, a reserved sentinel meaning "general /
@@ -7,15 +7,21 @@
 # always starts real people at 1.
 #
 # Run this ONCE against your existing database to clean up rows already
-# written before this fix existed. New rows going forward still need
-# whatever writes them (Agent 2's rule engine) updated to use 0 instead of
-# NULL directly - this script only fixes what's already there.
+# written before this fix existed. New rows going forward already use 0
+# instead of NULL directly (see GENERAL_PERSON_ID in agent2_rules/agent2.py) -
+# this script only fixes rows already sitting in the DB from before that fix.
 
 import sqlite3
 import sys
 import os
 
-ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+# FIX: this script lives in agent4_reporting/, one level below the project
+# root (same as agent1_tracking/agent1.py and agent4_reporting/agent4.py) -
+# a single os.path.dirname(abspath(__file__)) only gets back to
+# agent4_reporting/ itself, not the project root where config.py actually
+# lives. That's what "ModuleNotFoundError: No module named 'config'" was -
+# needs to go up TWO levels, same as every other agent script in this repo.
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT_DIR)
 from config import DATABASE_PATH
 

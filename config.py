@@ -4,7 +4,7 @@ import os
 # ── Project Paths ─────────────────────────────────────────────────────────────
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 VIDEO_PATH    = os.path.join(ROOT_DIR, "videos", "Chaos.mp4")
-DATABASE_PATH = os.path.join(ROOT_DIR, "database", "hfdb.db")
+DATABASE_PATH = os.path.join(ROOT_DIR, "database", "Test.db")
 CROPS_DIR     = os.path.join(ROOT_DIR, "crops")
 
 FACE_MODEL_PATH  = os.path.join(ROOT_DIR, "face_detection_model.pt")

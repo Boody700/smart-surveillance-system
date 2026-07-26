@@ -18,6 +18,7 @@
 #   completely separate run of this script on a later day.
 
 import os
+import re
 import sys
 import cv2
 import sqlite3
@@ -25,8 +26,9 @@ import json
 import numpy as np
 import faiss
 import time
-from collections import deque
+from collections import deque, defaultdict, Counter
 from ultralytics import YOLO
+from insightface.app import FaceAnalysis
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT_DIR)
@@ -71,6 +73,41 @@ if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
 LIVE_FRAME_PATH = os.path.join(ROOT_DIR, "live_frame.jpg")
 LIVE_FRAME_WRITE_EVERY_N_FRAMES = 15  # matches app.py's own UPDATE_EVERY_FRAMES cadence
 print("\n=== AGENT 1 STARTING: TRACKING + PERSISTENT RE-ID + DATABASE FEED ===")
+
+# ---------------------------------------------------------------------------
+# FACIAL RECOGNITION (named identity on top of person_id) - config
+# ---------------------------------------------------------------------------
+# Folded straight into the live loop (PASS 3c below) instead of running as
+# two separate offline scripts after the fact - same InsightFace/buffalo_l
+# model, reading the SAME known_faces/ folder used before. Supports either
+# flat "Name_number.jpg" files or a subfolder-per-person layout, detected
+# automatically per entry.
+KNOWN_FACES_DIR = os.path.join(ROOT_DIR, "agent1_tracking", "known_faces")
+FACE_ID_CTX_ID = -1              # -1 = CPU. Set to 0 if onnxruntime-gpu + CUDA are available.
+FACE_ID_DET_SIZE = (160, 160)    # crops fed in are already tight and pre-padded - a smaller det_size here is a big CPU win and doesn't cost accuracy on a crop this size
+FACE_ID_MATCH_THRESHOLD = 0.45   # cosine sim floor for a single sample to count as a vote at all (buffalo/ArcFace: same person usually 0.5-0.7+)
+FACE_ID_MIN_VOTES = 3            # need at least this many agreeing samples before trusting a name
+FACE_ID_MIN_AGREEMENT_RATIO = 0.5  # ...and they must be at least this fraction of everything checked for that person
+FACE_ID_FLAT_NAME_PATTERN = re.compile(r"^(.*?)_\d+$")  # "Omar_2" -> "Omar"
+
+# CPU PERFORMANCE: "buffalo_l" is InsightFace's large pack - noticeably
+# slower than "buffalo_s" on CPU for a modest accuracy trade. Bump back to
+# "buffalo_l" only if buffalo_s's matches look shaky on your footage.
+FACE_ID_MODEL_PACK = "buffalo_s"
+
+# CPU PERFORMANCE: the buffalo_* packs ship 5 ONNX models (detection,
+# recognition, 3D landmarks, 106-point landmarks, gender/age). This code
+# only ever calls .get() for a bbox + embedding, so 3 of those 5 run on
+# every single face check for zero benefit. Restricting allowed_modules
+# skips loading (and therefore running) the ones we don't use - this is
+# the single biggest CPU win here, well before considering a smaller pack.
+FACE_ID_ALLOWED_MODULES = ["detection", "recognition"]
+
+# Sleeping-detection debug logging (PASS 3d) is OFF by default - it used to
+# print a line for every tracked person on every throttled pose check,
+# which drowns out everything else in the console on a long video. Flip to
+# True only when you're actively tuning the sleeping heuristic thresholds.
+POSE_DEBUG_LOGGING = False
 
 # ---------------------------------------------------------------------------
 # CLASS: Temporal Memory - tracking previous positions
@@ -574,6 +611,182 @@ class PerformanceMonitor:
         print("="*60 + "\n")
 
 # ---------------------------------------------------------------------------
+# CLASS: Face Identifier - named identity on top of person_id
+# ---------------------------------------------------------------------------
+class FaceIdentifier:
+    """
+    Live facial recognition layer bolted directly onto agent1's existing
+    FACE pass (PASS 3c further down) - one pipeline pass instead of a
+    separate enrollment script + a separate offline matching script.
+
+      - Enrollment: on startup, walk KNOWN_FACES_DIR and embed every
+        enrolled photo with InsightFace (buffalo_l), grouped by name.
+        Supports flat "Name_number.jpg" files or a subfolder-per-person
+        layout, auto-detected per entry.
+
+      - Recognition: reuses the SAME face crop the FACE pass already found
+        for a tracked person this frame - no second detection pass over
+        the video - and matches it against the gallery right there, live.
+
+    A single frame's match is noisy (bad angle, motion blur), so a
+    person_id only gets a name drawn on screen once enough samples agree
+    (FACE_ID_MIN_VOTES / FACE_ID_MIN_AGREEMENT_RATIO).
+    """
+
+    def __init__(self, known_faces_dir=KNOWN_FACES_DIR):
+        self.gallery = defaultdict(list)   # name -> list of L2-normalized embeddings
+        self.app = None
+        self.enabled = False
+
+        self.votes = defaultdict(Counter)         # person_id -> Counter(name -> agreeing sample count)
+        self.samples_checked = defaultdict(int)   # person_id -> total samples checked (denominator for agreement ratio)
+        self.resolved_name = {}                   # person_id -> current best name, once confidence bar is cleared
+
+        if not os.path.isdir(known_faces_dir):
+            print(f"[FACE-ID][WARN] known_faces folder not found at {known_faces_dir} - "
+                  f"facial recognition disabled, boxes will show ID:<n> only.")
+            return
+
+        try:
+            print(f"[FACE-ID] Loading InsightFace ({FACE_ID_MODEL_PACK}, "
+                  f"modules={FACE_ID_ALLOWED_MODULES}) for facial recognition...")
+            self.app = FaceAnalysis(
+                name=FACE_ID_MODEL_PACK,
+                providers=["CPUExecutionProvider"],
+                allowed_modules=FACE_ID_ALLOWED_MODULES,
+            )
+            self.app.prepare(ctx_id=FACE_ID_CTX_ID, det_size=FACE_ID_DET_SIZE)
+        except Exception as e:
+            print(f"[FACE-ID][WARN] Failed to load InsightFace ({e}) - "
+                  f"facial recognition disabled, boxes will show ID:<n> only.")
+            return
+
+        self._build_gallery(known_faces_dir)
+        self.enabled = len(self.gallery) > 0
+
+    def _build_gallery(self, known_faces_dir):
+        """Same enrollment logic build_face_gallery.py used, run once here
+        at startup instead of as a separate script + separate DB table -
+        the gallery only needs to exist in memory for this run."""
+        people = defaultdict(list)
+        for entry in sorted(os.listdir(known_faces_dir)):
+            entry_path = os.path.join(known_faces_dir, entry)
+            if os.path.isdir(entry_path):
+                # Layout 2: subfolder-per-person
+                for img_name in sorted(os.listdir(entry_path)):
+                    if img_name.lower().endswith((".jpg", ".jpeg", ".png")):
+                        people[entry].append(os.path.join(entry_path, img_name))
+            elif entry.lower().endswith((".jpg", ".jpeg", ".png")):
+                # Layout 1: flat "Name_number.ext" files
+                stem = os.path.splitext(entry)[0]
+                match = FACE_ID_FLAT_NAME_PATTERN.match(stem)
+                name = match.group(1) if match else stem
+                people[name].append(entry_path)
+
+        if not people:
+            print(f"[FACE-ID][WARN] No photos or person subfolders found in {known_faces_dir} - "
+                  f"facial recognition disabled, boxes will show ID:<n> only.")
+            return
+
+        total_saved, total_skipped = 0, 0
+        for name, img_paths in sorted(people.items()):
+            saved = 0
+            for img_path in img_paths:
+                img = cv2.imread(img_path)
+                if img is None:
+                    print(f"[FACE-ID][WARN] {name}: couldn't read {os.path.basename(img_path)}, skipping.")
+                    total_skipped += 1
+                    continue
+                faces = self.app.get(img)
+                if not faces:
+                    print(f"[FACE-ID][WARN] {name}: no face detected in {os.path.basename(img_path)}, skipping.")
+                    total_skipped += 1
+                    continue
+                # Largest face in the enrollment photo = the intended subject
+                face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+                vec = face.normed_embedding.astype(np.float32)  # already L2-normalized
+                self.gallery[name].append(vec)
+                saved += 1
+                total_saved += 1
+            print(f"[FACE-ID] Enrolled '{name}': {saved}/{len(img_paths)} photo(s).")
+
+        if total_saved > 0:
+            print(f"[FACE-ID] Gallery ready: {total_saved} embedding(s) across {len(self.gallery)} "
+                  f"people ({total_skipped} photo(s) skipped).")
+        else:
+            print(f"[FACE-ID][WARN] Every enrollment photo failed to embed - "
+                  f"facial recognition disabled, boxes will show ID:<n> only.")
+
+    def _best_gallery_match(self, vec):
+        """Compare against EVERY stored embedding for every name (not a
+        per-name centroid) - a front photo and a side photo of the same
+        person shouldn't get blended into one average."""
+        best_name, best_sim = None, -1.0
+        for name, vectors in self.gallery.items():
+            for gv in vectors:
+                sim = float(np.dot(vec, gv))
+                if sim > best_sim:
+                    best_sim, best_name = sim, name
+        return best_name, best_sim
+
+    def observe(self, person_id, face_crop_bgr):
+        """Feed one face crop - the SAME crop the FACE pass (PASS 3c) just
+        found for this person_id this frame - through InsightFace and fold
+        the result into that person_id's running vote tally.
+
+        CPU PERFORMANCE: once a person_id is already confidently resolved,
+        there's nothing left to gain from continuing to run a full
+        InsightFace pass on them every throttled frame for the rest of the
+        video - that's the single biggest recurring cost in this class
+        once most people in frame have been identified, so skip it
+        entirely rather than re-confirming a name that's already locked in."""
+        if person_id in self.resolved_name:
+            return None, 0.0
+
+        if not self.enabled or face_crop_bgr is None or face_crop_bgr.size == 0:
+            return None, 0.0
+
+        faces = self.app.get(face_crop_bgr)
+        if not faces:
+            return None, 0.0
+
+        face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+        vec = face.normed_embedding.astype(np.float32)
+        name, sim = self._best_gallery_match(vec)
+
+        self.samples_checked[person_id] += 1
+        if name is not None and sim >= FACE_ID_MATCH_THRESHOLD:
+            self.votes[person_id][name] += 1
+            self._recompute(person_id)
+
+        return name, sim
+
+    def _recompute(self, person_id):
+        checked = self.samples_checked[person_id]
+        votes = self.votes[person_id]
+        if checked == 0 or not votes:
+            return
+        winner, winner_votes = votes.most_common(1)[0]
+        agreement = winner_votes / checked
+        if winner_votes >= FACE_ID_MIN_VOTES and agreement >= FACE_ID_MIN_AGREEMENT_RATIO:
+            self.resolved_name[person_id] = winner
+
+    def display_name(self, person_id):
+        """Confidence-gated name for this person_id, or None if not
+        resolved yet - callers fall back to 'ID:<person_id>' when None."""
+        return self.resolved_name.get(person_id)
+
+    def stats(self, person_id):
+        """(best_name_or_None, agreement_ratio, num_votes, num_samples)."""
+        checked = self.samples_checked.get(person_id, 0)
+        votes = self.votes.get(person_id, Counter())
+        if not votes:
+            return None, 0.0, 0, checked
+        winner, winner_votes = votes.most_common(1)[0]
+        agreement = winner_votes / checked if checked else 0.0
+        return winner, agreement, winner_votes, checked
+
+# ---------------------------------------------------------------------------
 # CONNECT TO DATABASE
 # ---------------------------------------------------------------------------
 conn = sqlite3.connect(DATABASE_PATH, timeout=30)
@@ -588,6 +801,32 @@ cursor.execute("DELETE FROM sqlite_sequence WHERE name='events'")
 conn.commit()
 print(f"[INFO] Connected to database: {DATABASE_PATH}")
 print("[INFO] Events cleared for this run. Persistent identity gallery kept intact.")
+
+# --- NAMED IDENTITIES (facial recognition result: person_id -> name) ---
+# Created here so agent1 can upsert into it live as names get resolved
+# during the run. NEVER dropped/wiped (CREATE TABLE IF NOT EXISTS, no
+# DELETE) - same reasoning as person_gallery: a name once resolved for a
+# person_id should stick around across runs, not reset every video.
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS person_identities (
+        person_id   INTEGER PRIMARY KEY,
+        name        TEXT,
+        confidence  REAL,
+        num_votes   INTEGER,
+        num_samples INTEGER
+    )
+""")
+conn.commit()
+
+def upsert_person_identity(pid, name, confidence, num_votes, num_samples):
+    """Write/refresh this person_id's current best-guess name into the DB.
+    INSERT OR REPLACE keyed on person_id, so re-running this for the same
+    person just overwrites their row with the latest tally."""
+    cursor.execute("""
+        INSERT OR REPLACE INTO person_identities
+            (person_id, name, confidence, num_votes, num_samples)
+        VALUES (?, ?, ?, ?, ?)
+    """, (pid, name, round(confidence, 4), num_votes, num_samples))
 
 # ---------------------------------------------------------------------------
 # OPEN VIDEO
@@ -636,7 +875,7 @@ def draw_zones(frame):
 # --- SET UP OUTPUT VIDEO FOR VISUAL VERIFICATION ---
 output_dir = os.path.join(ROOT_DIR, "output_videos")
 os.makedirs(output_dir, exist_ok=True)
-output_path = os.path.join(output_dir, "output_agent1_new9.mp4")
+output_path = os.path.join(output_dir, "output_agent1_new2.mp4")
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 video_writer = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
@@ -680,6 +919,10 @@ else:
 # phone/face models and would have silently disabled sleeping detection).
 print(f"[INFO] Loading pose model: {POSE_MODEL_PATH}")
 pose_model = YOLO(POSE_MODEL_PATH)
+
+# --- FACIAL RECOGNITION (own pass, rides on top of the FACE pass's own
+# crops below - see PASS 3c) ---
+face_identifier = FaceIdentifier()
 
 # person_id -> {"consecutive": int, "absent": int, "logged": bool}
 # consecutive: how many checked frames in a row looked like sleeping (must
@@ -879,7 +1122,26 @@ def detect_and_fix_duplicate_ids():
         for duplicate_id in group:
             if duplicate_id != primary_id:
                 gallery.merge_identities(primary_id, duplicate_id, frame_count)
-                
+
+                # Fold the duplicate's face-recognition vote tally into the
+                # primary's, so a name resolved under either old ID isn't
+                # lost/orphaned by the merge - same reasoning as merging
+                # the appearance embeddings above.
+                if duplicate_id in face_identifier.votes:
+                    face_identifier.votes[primary_id].update(face_identifier.votes[duplicate_id])
+                    del face_identifier.votes[duplicate_id]
+                face_identifier.samples_checked[primary_id] = (
+                    face_identifier.samples_checked.get(primary_id, 0) +
+                    face_identifier.samples_checked.pop(duplicate_id, 0)
+                )
+                face_identifier.resolved_name.pop(duplicate_id, None)
+                face_identifier._recompute(primary_id)
+                resolved = face_identifier.display_name(primary_id)
+                if resolved is not None:
+                    name, agreement, votes_n, samples_n = face_identifier.stats(primary_id)
+                    upsert_person_identity(primary_id, name, agreement, votes_n, samples_n)
+                cursor.execute("DELETE FROM person_identities WHERE person_id = ?", (duplicate_id,))
+
                 # Update the track_to_person map
                 for track_id, person_id in list(track_to_person.items()):
                     if person_id == duplicate_id:
@@ -1151,7 +1413,12 @@ while True:
         color = (0, 255, 0) if person_id in gallery.embeddings else (0, 255, 255)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1)
 
-        label = f"ID:{person_id}"
+        # Once facial recognition has confidently resolved a name for this
+        # person_id, show that instead of the bare numeric ID - falls back
+        # to "ID:<n>" for anyone not yet recognized (or not enrolled in
+        # known_faces/ at all).
+        resolved_name = face_identifier.display_name(person_id)
+        label = resolved_name if resolved_name else f"ID:{person_id}"
         font_scale = 0.32
         (txt_w, txt_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
         cv2.rectangle(frame, (x1, y1 - txt_h - 4), (x1 + txt_w + 2, y1), color, -1)
@@ -1264,13 +1531,32 @@ while True:
                 fx1_full, fy1_full, fx2_full, fy2_full
             ))
 
-            cv2.rectangle(frame, (fx1_full, fy1_full), (fx2_full, fy2_full), (255, 100, 0), 1)
-            flabel = f"FACE P{person_id}"
+            # --- FACIAL RECOGNITION: feed this exact same face crop (no
+            # second detection pass) into InsightFace and fold the result
+            # into person_id's running vote tally. Once enough samples
+            # agree, display_name() starts returning an actual name
+            # instead of None, and every box for this person_id (this one
+            # AND the main person box drawn in PASS 3 above) switches from
+            # "ID:<n>" to that name. observe() itself no-ops once resolved
+            # (see FaceIdentifier.observe), so skip the stats/DB-upsert
+            # dance too once there's nothing new to write.
+            already_resolved = person_id in face_identifier.resolved_name
+            if not already_resolved:
+                face_crop_for_id = crop[fy1:fy2, fx1:fx2]
+                face_identifier.observe(person_id, face_crop_for_id)
+                name, agreement, votes_n, samples_n = face_identifier.stats(person_id)
+                if name is not None:
+                    upsert_person_identity(person_id, name, agreement, votes_n, samples_n)
+
+            resolved = face_identifier.display_name(person_id)
+            flabel = resolved if resolved else f"FACE P{person_id}"
             (fw_txt, fh_txt), _ = cv2.getTextSize(flabel, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
             cv2.rectangle(frame, (fx1_full, fy1_full - fh_txt - 5),
                           (fx1_full + fw_txt + 3, fy1_full), (200, 80, 0), -1)
             cv2.putText(frame, flabel, (fx1_full + 2, fy1_full - 3),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+            box_color = (0, 200, 0) if resolved else (255, 100, 0)  # green once a name is confirmed
+            cv2.rectangle(frame, (fx1_full, fy1_full), (fx2_full, fy2_full), box_color, 1)
 
     # --- PASS 3d: POSE ESTIMATION — SLEEPING DETECTION. Own model/pass,
     # scoped to each confirmed person's own bbox this frame, same throttle
@@ -1304,7 +1590,8 @@ while True:
             hit for hit in reembed_proposals + passthrough_hits
             if hit["track_id"] in track_to_person
         ]
-        print(f"[POSE-DEBUG] Frame {frame_count}: checking {len(pose_check_hits)} tracked person(s) for sleeping.")
+        if POSE_DEBUG_LOGGING:
+            print(f"[POSE-DEBUG] Frame {frame_count}: checking {len(pose_check_hits)} tracked person(s) for sleeping.")
 
         for hit in pose_check_hits:
             track_id = hit["track_id"]
@@ -1322,10 +1609,11 @@ while True:
             if pboxes is None or len(pboxes) == 0 or keypoints is None or keypoints.conf is None:
                 # No pose at all this check - a missed check, not evidence
                 # either way, so it only counts toward the grace window.
-                print(f"[POSE-DEBUG] Person {person_id}: NO POSE DETECTED IN CROP "
-                      f"(pboxes={0 if pboxes is None else len(pboxes)}, "
-                      f"keypoints_present={keypoints is not None}) "
-                      f"crop_shape={crop.shape}")
+                if POSE_DEBUG_LOGGING:
+                    print(f"[POSE-DEBUG] Person {person_id}: NO POSE DETECTED IN CROP "
+                          f"(pboxes={0 if pboxes is None else len(pboxes)}, "
+                          f"keypoints_present={keypoints is not None}) "
+                          f"crop_shape={crop.shape}")
                 state["absent"] += 1
                 if state["absent"] > SLEEP_GRACE_FRAMES:
                     state["consecutive"] = 0
@@ -1336,8 +1624,9 @@ while True:
             kpts_conf = keypoints.conf[best_i].tolist()
             kpts_xy = keypoints.xy[best_i].tolist()
             if len(kpts_conf) < 7:
-                print(f"[POSE-DEBUG] Person {person_id}: keypoints returned but too few "
-                      f"({len(kpts_conf)} - expected 17). Wrong pose model/task?")
+                if POSE_DEBUG_LOGGING:
+                    print(f"[POSE-DEBUG] Person {person_id}: keypoints returned but too few "
+                          f"({len(kpts_conf)} - expected 17). Wrong pose model/task?")
                 state["absent"] += 1
                 continue
 
@@ -1371,11 +1660,12 @@ while True:
                 not face_recently_seen
             )
 
-            hdr_str = f"{head_drop_ratio:.3f}" if head_drop_ratio is not None else "N/A"
-            print(f"[POSE-DEBUG] Person {person_id}: face_visible_score={face_visible_score:.2f} "
-                  f"head_drop_ratio={hdr_str} shoulders_visible={shoulders_visible} "
-                  f"frames_since_face={frames_since_face} "
-                  f"-> candidate={is_sleeping_candidate} (consecutive={state['consecutive']})")
+            if POSE_DEBUG_LOGGING:
+                hdr_str = f"{head_drop_ratio:.3f}" if head_drop_ratio is not None else "N/A"
+                print(f"[POSE-DEBUG] Person {person_id}: face_visible_score={face_visible_score:.2f} "
+                      f"head_drop_ratio={hdr_str} shoulders_visible={shoulders_visible} "
+                      f"frames_since_face={frames_since_face} "
+                      f"-> candidate={is_sleeping_candidate} (consecutive={state['consecutive']})")
 
             if is_sleeping_candidate:
                 state["consecutive"] += 1

@@ -794,7 +794,7 @@ with tab1:
             if not os.path.exists(selected_video):
                 st.error("Please upload a video first.")
             else:
-                agent1_path = os.path.join(ROOT_DIR, "agent1_tracking", "agent1.py")
+                agent1_path = os.path.join(ROOT_DIR, "agent1_tracking", "agent1s.py")
                 if not os.path.exists(agent1_path):
                     st.error(f"agent1.py not found at {agent1_path}")
                 else:
