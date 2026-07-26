@@ -375,10 +375,6 @@ hr { border-color: #1c2636; margin: 1.5rem 0; }
 """, unsafe_allow_html=True)
 
 # ── ACCESS CONTROL ────────────────────────────────────────────────────────────
-# Lightweight session gate for demo/access-control UX — NOT production auth:
-# plaintext credentials in source, no hashing, no rate limiting, resets on
-# every process restart. Swap AUTH_USERS for a real user store + hashed
-# passwords (e.g. streamlit-authenticator) before this guards anything real.
 AUTH_USERS = {
     "admin": "123",
     "gamal" : "Jimmy"
@@ -444,12 +440,6 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── VIDEO SOURCE (persistent, shown above all tabs) ───────────────────────────
-# Deliberately NOT nested inside a tab: whichever video is picked here is what
-# both "Calibrate Zones" and "Run Detection" use, in whatever order you visit
-# them — you're never blocked from calibrating just because you haven't run
-# detection yet, and never blocked from detecting just because you haven't
-# calibrated. Zones are optional for Agent 1 either way; they only matter once
-# Agent 2 runs.
 src_col1, src_col2 = st.columns([2.2, 1], gap="large")
 with src_col1:
     uploaded = st.file_uploader(
@@ -502,15 +492,32 @@ def get_violations():
     except:
         return []
 
+def format_timestamp(seconds):
+    """Format a point in time as M:SS (e.g. 192.4 -> '3:12'). Durations
+    (how long something lasted) stay as seconds/minutes elsewhere - this
+    is specifically for WHEN something happened in the video."""
+    seconds = max(0, int(seconds or 0))
+    minutes, secs = divmod(seconds, 60)
+    return f"{minutes}:{secs:02d}"
+
+def person_label(pid):
+    """person_id can be NULL (legacy rows) or 0 (the reserved sentinel) for
+    a general/whole-room violation that was never tied to one tracked
+    person - e.g. "everyone AFK". Neither of those is actually "Person X",
+    so render them as a clear "General" label instead of the literal
+    "Person None" / "Person 0" that f-string interpolation would otherwise
+    produce."""
+    if pid is None or pid == 0:
+        return "General"
+    return f"Person {pid}"
+
 def run_agent(script_path, log_placeholder, cwd=ROOT_DIR, extra_args=None):
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
-    # Force the agent to use UTF-8 encoding for its internal print statements
     env["PYTHONIOENCODING"] = "utf-8"
 
     cmd = [sys.executable, script_path] + (extra_args or [])
     lines = []
-    # Add encoding='utf-8' and errors='replace' here
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -537,13 +544,7 @@ def run_agent(script_path, log_placeholder, cwd=ROOT_DIR, extra_args=None):
 def run_agent_with_progress(script_path, progress_bar, readout_placeholder,
                              image_placeholder, log_placeholder, cwd=ROOT_DIR,
                              extra_args=None):
-    """
-    Like run_agent, but understands 'PROGRESS:frame:total' lines emitted by
-    agent1cl.py. Drives a real progress bar and refreshes a live annotated
-    frame preview as detection runs, instead of just dumping raw logs.
-    """
-    UPDATE_EVERY_FRAMES = 15  # refresh cadence — independent of % change,
-                              # so long videos don't go 50+ frames between updates
+    UPDATE_EVERY_FRAMES = 15
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -574,8 +575,6 @@ def run_agent_with_progress(script_path, progress_bar, readout_placeholder,
             except (ValueError, ZeroDivisionError):
                 continue
 
-            # Refresh every UPDATE_EVERY_FRAMES frames (or the final frame),
-            # not just when the rounded percentage changes.
             if frame_no % UPDATE_EVERY_FRAMES == 0 or frame_no >= total:
                 pct_int = int(pct * 100)
                 progress_bar.progress(pct)
@@ -650,9 +649,6 @@ with tab0:
                 fh, fw = frame_rgb.shape[:2]
                 zones_json_path = os.path.join(os.path.dirname(DATABASE_PATH), "zones.json")
 
-                # Load any existing zones.json once per session — stored
-                # already-normalized, since that's what both the component
-                # and zones.json itself use.
                 if "calib_zones_norm" not in st.session_state:
                     loaded = []
                     if os.path.exists(zones_json_path):
@@ -703,10 +699,6 @@ with tab0:
                             json.dump({"zones": st.session_state["calib_zones_norm"]}, f, indent=2)
                         st.success(f"✓ Saved {n_zones} zone(s) to zones.json")
 
-                # Handle a completed drag. The component already returns
-                # coordinates in the ORIGINAL frame's pixel space (it does
-                # its own rescaling internally), so no conversion needed here
-                # beyond normalizing to 0-1 for zones.json's format.
                 if drag_value is not None and drag_value.get("x1") is not None:
                     drag_time = drag_value.get("unix_time")
                     if drag_time != st.session_state["calib_last_drag_time"]:
@@ -731,7 +723,6 @@ with tab1:
     left, right = st.columns([1, 1.6], gap="large")
 
     with left:
-        # Pipeline steps
         agent1_done = st.session_state.get("agent1_done", False)
         st.markdown(f"""
         <div class="card">
@@ -757,7 +748,6 @@ with tab1:
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # Stats
         people, detections, violations = get_stats()
         c1, c2, c3 = st.columns(3)
         c1.metric("People", people)
@@ -802,7 +792,7 @@ with tab1:
             if not os.path.exists(selected_video):
                 st.error("Please upload a video first.")
             else:
-                agent1_path = os.path.join(ROOT_DIR, "agent1_tracking", "agent1t.py")
+                agent1_path = os.path.join(ROOT_DIR, "agent1_tracking", "agent1.py")
                 if not os.path.exists(agent1_path):
                     st.error(f"agent1.py not found at {agent1_path}")
                 else:
@@ -885,7 +875,6 @@ with tab2:
 
     st.markdown("<hr>", unsafe_allow_html=True)
 
-    # Show violations
     violations = get_violations()
     if violations:
         st.markdown(f"### Detected Violations")
@@ -916,7 +905,7 @@ with tab2:
 
             with img_col:
                 if crop_path and os.path.exists(crop_path):
-                    st.image(crop_path, use_container_width=True, caption=f"Captured at {ts:.0f}s")
+                    st.image(crop_path, use_container_width=True, caption=f"Captured at {format_timestamp(ts)}")
                 else:
                     st.markdown(
                         '<div style="background:#0a0f1c;border:1px solid #1c2636;border-radius:10px;height:200px;display:flex;align-items:center;justify-content:center;color:#45536b;font-size:0.8rem;">No image available</div>',
@@ -928,7 +917,7 @@ with tab2:
                 <div class="vcard {card_cls}">
                     {pill}
                     <div style="margin-top:1rem;font-size:0.8rem;color:#5b6b82;">{label}</div>
-                    <div style="font-size:1.6rem;font-weight:700;color:#fff;margin-top:0.25rem;">Person {pid}</div>
+                    <div style="font-size:1.6rem;font-weight:700;color:#fff;margin-top:0.25rem;">{person_label(pid)}</div>
                     <hr style="margin:1rem 0;border-color:#1c2636;">
                     <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;">
                         <div>
@@ -938,7 +927,7 @@ with tab2:
                         </div>
                         <div>
                             <div style="color:#45536b;font-size:0.68rem;text-transform:uppercase;letter-spacing:0.1em;">Video Timestamp</div>
-                            <div style="color:#fff;font-weight:600;font-size:1.1rem;margin-top:2px;">{ts:.0f}s</div>
+                            <div style="color:#fff;font-weight:600;font-size:1.1rem;margin-top:2px;">{format_timestamp(ts)}</div>
                             <div style="color:#5b6b82;font-size:0.75rem;">{ts/60:.1f} min mark</div>
                         </div>
                     </div>
@@ -983,10 +972,10 @@ with tab3:
         for v in violations:
             pid, etype, duration, ts, crop, vlm = v
             rows.append({
-                "Person": f"Person {pid}",
+                "Person": person_label(pid),
                 "Violation": etype.replace("violation_", "").replace("_", " ").upper(),
                 "Duration": f"{int(duration)}s ({duration/60:.1f} min)",
-                "Timestamp": f"{ts:.0f}s into video",
+                "Timestamp": format_timestamp(ts),
                 "VLM Verdict": vlm or "—"
             })
         df = pd.DataFrame(rows)
@@ -1008,11 +997,8 @@ with tab3:
     )
 
     if report_btn:
-        agent4_path = os.path.join(ROOT_DIR, "agent4_dashboard", "agent4cl.py")
+        agent4_path = os.path.join(ROOT_DIR, "agent4_reporting", "agent4.py")
         if os.path.exists(agent4_path):
-            # Streamed like Agents 1 & 2 rather than a silent subprocess.run -
-            # the per-person LLM narrative calls (llama3.1:8b via Ollama) take
-            # real time, so a static spinner gives no sense of progress.
             code4, lines4 = run_agent(agent4_path, log4_box)
 
             if code4 == 0:
@@ -1024,4 +1010,4 @@ with tab3:
             else:
                 st.error("Agent 4 failed. Check the log above.")
         else:
-            st.info("Agent 4 not set up yet. Wire your PDF generator to agent4_dashboard/agent4.py")
+            st.info("Agent 4 not set up yet. Wire your PDF generator to agent4_reporting/agent4.py")

@@ -67,6 +67,14 @@ PHONE_COCO_FALLBACK_CONF = 0.40
 PHONE_COCO_FALLBACK_IOU  = 0.30
 PHONE_DETECT_EVERY_N_FRAMES = 1   # phone episodes are brief - check every frame
 
+# Phone-to-face matching thresholds for Agent 2.
+PHONE_MIN_PERSON_OVERLAP = 0.3
+PHONE_FACE_MIN_SCORE = 0.35
+PHONE_FACE_MAX_CENTER_DIST_RATIO = 1.4
+PHONE_FACE_RECENCY_SECONDS = 1.0
+PHONE_MIN_CONSECUTIVE_SECONDS = 4.0
+PHONE_GAP_SECONDS = 1.0
+
 # ── Face Detection (own model, scoped to each tracked person's box) ──────────
 FACE_CONF = 0.50
 FACE_IOU  = 0.40
@@ -80,12 +88,13 @@ POSE_MODEL_PATH = "yolo26n-pose.pt"   # stock Ultralytics checkpoint, auto-downl
 POSE_CONF = 0.5
 POSE_DETECT_EVERY_N_FRAMES = 1
 
-SLEEP_HEAD_DROP_RATIO = 0.15       
+SLEEP_HEAD_DROP_RATIO = 0.15
 SLEEP_FACE_VISIBILITY_THRESHOLD = 0.95   # max confidence across nose/eyes/ears below this = face effectively not visible
 SLEEP_FACE_RECENCY_FRAMES = 60           # if the face pass found a real face within this many frames, don't call it sleeping
 SLEEP_MIN_CONSECUTIVE_FRAMES = 10        # must hold for this many checked frames in a row before it's trusted
 SLEEP_GRACE_FRAMES = 6                   # one ambiguous check doesn't reset an ongoing episode
 
-# --- Phone detection: only count a phone as "in use" if it overlaps a
-# currently tracked person's box, not just anywhere in frame ---
-PHONE_MIN_PERSON_OVERLAP = 0.3
+# Agent 2 uses a duration gate on top of the raw sleeping detections.
+SLEEP_MIN_DURATION_SECONDS = 8.0
+SLEEP_GAP_SECONDS = 1.0
+

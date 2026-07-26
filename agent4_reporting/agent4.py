@@ -41,6 +41,20 @@ print("\n=== AGENT 4 STARTING: REPORT GENERATION ===")
 
 
 def fetch_violations():
+    """
+    Returns (people, general) where:
+      people:  dict of {person_id (int) -> [violation dicts]} for violations
+               tied to a specific tracked identity.
+      general: list of violation dicts for rows with person_id IS NULL - e.g.
+               a whole-room/whole-frame violation (like "everyone AFK") that
+               was never scoped to one person in the first place. These are
+               NOT a "Person None" - they're a separate category entirely, so
+               they're kept out of `people` from the start rather than being
+               grouped under a None key (which is also what crashed
+               sorted(people.keys()) below: None and str/int can't be
+               compared in Python 3, and it was semantically wrong besides -
+               a person_id of NULL was never actually "a person").
+    """
     conn = sqlite3.connect(DATABASE_PATH)
     rows = conn.execute("""
         SELECT person_id, event_type, timestamp, duration_seconds,
@@ -52,15 +66,23 @@ def fetch_violations():
     conn.close()
 
     people = {}
+    general = []
     for pid, etype, ts, duration, zone_id, zone_name, vlm in rows:
-        people.setdefault(pid, []).append({
+        entry = {
             "type": etype.replace("violation_", "").replace("_", " ").upper(),
             "timestamp": ts or 0.0,
             "duration": duration or 0.0,
             "zone_name": zone_name,
             "vlm": vlm or "\u2014",
-        })
-    return people
+        }
+        # pid is None: legacy rows written before the migration/sentinel fix.
+        # pid == 0: the reserved "general/whole-room" sentinel going forward.
+        # Either way, it's not a real tracked person - route to `general`.
+        if pid is None or pid == 0:
+            general.append(entry)
+        else:
+            people.setdefault(pid, []).append(entry)
+    return people, general
 
 
 def generate_narrative(person_id, violations):
@@ -102,7 +124,30 @@ def generate_narrative(person_id, violations):
                 "see the table above for the full deterministic violation record.")
 
 
-def build_pdf(people):
+def build_violation_table(violations):
+    """Shared table-building logic for both a person's section and the
+    general (unattributed) section below."""
+    table_data = [["Type", "Time", "Duration", "Zone", "VLM Verdict"]]
+    for v in violations:
+        mins = v["timestamp"] / 60
+        table_data.append([
+            v["type"], f"{mins:.1f} min", f"{v['duration']:.0f}s",
+            v["zone_name"] or "\u2014", v["vlm"],
+        ])
+
+    tbl = Table(table_data, colWidths=[1.3*inch, 0.9*inch, 0.9*inch, 1.2*inch, 1.6*inch])
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1e1b4b")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f1f5f9")]),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    return tbl
+
+
+def build_pdf(people, general):
     doc = SimpleDocTemplate(
         REPORT_PATH, pagesize=letter,
         topMargin=0.6 * inch, bottomMargin=0.6 * inch,
@@ -123,44 +168,41 @@ def build_pdf(people):
         Spacer(1, 0.25 * inch),
     ]
 
-    if not people:
+    if not people and not general:
         story.append(Paragraph("No violations were recorded for this session.", body_style))
     else:
+        # Per-person sections first, sorted by person_id - safe now since
+        # `people` only ever contains real (non-None) person_ids.
         for pid in sorted(people.keys()):
             violations = people[pid]
             story.append(Paragraph(f"Person {pid}", styles["Heading2"]))
-
-            table_data = [["Type", "Time", "Duration", "Zone", "VLM Verdict"]]
-            for v in violations:
-                mins = v["timestamp"] / 60
-                table_data.append([
-                    v["type"], f"{mins:.1f} min", f"{v['duration']:.0f}s",
-                    v["zone_name"] or "\u2014", v["vlm"],
-                ])
-
-            tbl = Table(table_data, colWidths=[1.3*inch, 0.9*inch, 0.9*inch, 1.2*inch, 1.6*inch])
-            tbl.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1e1b4b")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTSIZE", (0, 0), (-1, -1), 8.5),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f1f5f9")]),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ]))
-            story.append(tbl)
+            story.append(build_violation_table(violations))
             story.append(Spacer(1, 0.15 * inch))
 
             print(f"[INFO] Generating narrative for Person {pid} ({len(violations)} violation(s))...")
             narrative = generate_narrative(pid, violations)
             story.append(Paragraph(f"<b>Summary:</b> {narrative}", narrative_style))
 
+        # General/unattributed violations - things like a whole-room "everyone
+        # AFK" event that was never tied to one tracked identity. Shown as
+        # its own section rather than under any "Person" heading, and with
+        # no per-person narrative (there's no single person's pattern to
+        # summarize here).
+        if general:
+            story.append(Paragraph("General Violations (not tied to a specific person)", styles["Heading2"]))
+            story.append(build_violation_table(general))
+            story.append(Spacer(1, 0.15 * inch))
+
     doc.build(story)
 
 
 def main():
-    people = fetch_violations()
-    print(f"[INFO] {len(people)} person(s) with violations found.")
-    build_pdf(people)
+    people, general = fetch_violations()
+    total_people = len(people)
+    print(f"[INFO] {total_people} person(s) with violations found.")
+    if general:
+        print(f"[INFO] {len(general)} general (unattributed) violation(s) found.")
+    build_pdf(people, general)
     print(f"[SUCCESS] Report saved to {REPORT_PATH}")
     print("\n########################################")
     print("  AGENT 4 COMPLETE: REPORT GENERATED")

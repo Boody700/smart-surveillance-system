@@ -1,50 +1,93 @@
-# agent3_vlm/agent3.py
-# Agent 3: VLM Auditor using LLaVA via Ollama.
-# Supports single image OR two images (before + after) for richer analysis.
-#
-# Color legend in frames (matches agent2.py drawing):
-#   RED zone    = person's assigned home zone
-#   BLUE zones  = other zones
-#   GREEN box   = person being analyzed
-#   White on dark red = violation label
-#   White on black    = duration text
-
 import ollama
+
+VLM_MODEL = "qwen2.5vl:7b"
+
 
 def run_agent3_auditor(image_path, person_id, assigned_zone):
     """
-    Analyze a violation frame using LLaVA.
-    
-    image_path   — frame when violation was detected (person leaving / absent)
+    Analyze a violation frame using the VLM.
+
+    NOTE:
+    Agent 2 already detects the violation deterministically.
+    Agent 3 is only used as a visual confirmation.
     """
 
-        # Single image prompt
-    prompt = (
-            f"You are a workplace security auditor reviewing a CCTV frame. "
-            f"COLOR GUIDE: "
-            f"RED outlined zone = Person {person_id}'s assigned desk (Zone {assigned_zone}). "
-            f"BLUE outlined zones = other people's Zones. "
-            f"BRIGHT GREEN rectangle = Person {person_id} being analyzed , if Theres no green rectangle, the person is not visible in the frame which means he's either afk or left the area depending on whether he was seen in Future Frames or not. "
-            f"Classify Person {person_id}'s current status: "
-            f"'OTHER_ZONE' = person is inside a blue zone (someone else's desk). "
-            f"'LOITERING' = person with the green frame is present and in an open space not inside any zones, with no zone around them. "
-            f"'AFK' = the person assigned to the RED zone is not sitting in their designated chair, even if the desk/laptop is still there. "
-            f"Output ONLY one word. No explanation."
-        )
-    images = [image_path]
+    prompt = f"""
+You are analysing an annotated workplace CCTV frame.
+
+VISUAL LEGEND
+-------------
+RED outlined zone:
+    Person {person_id}'s assigned workstation (Zone {assigned_zone}).
+
+BLUE outlined zones:
+    Other employees' assigned workstations.
+
+BRIGHT GREEN bounding box:
+    Person {person_id}.
+    There is NEVER more than one green box.
+
+TASK
+----
+Follow these steps EXACTLY.
+
+STEP 1
+Check whether a BRIGHT GREEN bounding box exists anywhere in the image.
+
+If NO green box exists,
+respond with exactly:
+
+AFK
+
+Do NOT guess where the employee went.
+Do NOT analyse any other people.
+Do NOT continue to Step 2.
+
+STEP 2
+If a GREEN box exists:
+
+Determine where the GREEN box is located.
+
+If the GREEN box is inside any BLUE zone:
+
+OTHER_ZONE
+
+If the GREEN box is outside ALL coloured zones:
+
+LOITERING
+
+OUTPUT RULES
+------------
+Return ONLY ONE of these words.
+
+AFK
+OTHER_ZONE
+LOITERING
+
+Do not explain.
+Do not use punctuation.
+Do not return any other text.
+"""
 
     try:
         response = ollama.chat(
-            model='llava',
+            model=VLM_MODEL,
             messages=[{
-                'role': 'user',
-                'content': prompt,
-                'images': images
+                "role": "user",
+                "content": prompt,
+                "images": [image_path]
             }]
         )
-        answer = response['message']['content'].strip().upper()
-        valid  = {"INSIDE", "OTHER_ZONE", "LOITERING", "AFK"}
-        return answer if answer in valid else "UNKNOWN"
+
+        answer = response["message"]["content"].strip().upper()
+
+        valid = {"AFK", "OTHER_ZONE", "LOITERING"}
+
+        if answer in valid:
+            return answer
+
+        return "UNKNOWN"
+
     except Exception as e:
-        print(f"  [Agent3 ERROR] {e}")
+        print(f"[Agent3 ERROR] {e}")
         return "UNKNOWN"
